@@ -24,10 +24,12 @@ import Debug.Trace
 
 -- (if you want a list of results, earlier results first, earley can do that)
 
+type M s e i = State s e i -> ST s (State s e i)
+
 -- TODO: more stuff here
 data State s e i = State {
   reset :: ![ST s ()],
-  next :: ![State s e i -> ST s (State s e i)],
+  next :: ![M s e i],
   curPos :: {-# UNPACK #-} !Int,
   input :: i,
   names :: [e]
@@ -35,11 +37,9 @@ data State s e i = State {
 -- obvious way to do coalescing & skip through input is to have next be
 -- :: Map (Position,RuleI s e i a) [a -> State s e i -> ST s (State s e i)]
 
--- type K s e i = State s e i -> ST s (State s e i)
-
 
 newtype Parser s e i a = Parser {
-  unParser :: (a -> State s e i -> ST s (State s e i)) -> State s e i -> ST s (State s e i)
+  unParser :: (a -> M s e i) -> M s e i
 }
 
 liftST :: ST s a -> Parser s e i a
@@ -56,16 +56,16 @@ liftST f = Parser $ \cb s -> f >>= flip cb s
 -- maybe could w/ nulls transformation though
 
 -- TODO: could we store a [Results s e i a] here?
-data RuleResults s e i a = RuleResults [a] [a -> State s e i -> ST s (State s e i)]
+data RuleResults s e i a = RuleResults [a] [a -> M s e i]
 
 -- so we reset results after done w/ pos when it is Just
-data RuleI s e i a = RuleI [a] [a -> State s e i -> ST s (State s e i)]
+data RuleI s e i a = RuleI [a] [a -> M s e i]
 
 -- data Results s e i a where
 --   Results :: STRef s [a] -> STRef s [a -> State s e i -> ST s (State s e i)] -> Results s e i a
 
 
-newtype Results s e i a = Results ((a -> State s e i -> ST s (State s e i)) -> State s e i -> ST s (State s e i))
+newtype Results s e i a = Results ((a -> M s e i) -> M s e i)
 
 -- FIXME: can merge results at same rule w/ diff start pos & same end pos!
 -- (if a calls b at pos i and j, and i-k & j-k both return results, only need to return once)
