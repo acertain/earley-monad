@@ -10,6 +10,7 @@ import Data.ListLike(ListLike)
 import qualified Data.ListLike as ListLike
 import Data.STRef
 import Text.Earley.Grammar
+import Debug.Trace
 #if !MIN_VERSION_base(4,8,0)
 import Data.Monoid
 #endif
@@ -140,15 +141,16 @@ contToState _   r (FinalCont args)   = Final $ r >>= args
 -- | Strings of non-ambiguous continuations can be optimised by removing
 -- indirections.
 simplifyCont :: Conts s r e t b a -> ST s [Cont s r e t b a]
-simplifyCont Conts {conts = cont} = readSTRef cont >>= go False
-  where
-    go !_ [Cont g (Pure f) args cont'] = do
-      ks' <- simplifyCont cont'
-      go True $ map (contraMapCont $ \b -> fmap f (g b) >>= args) ks'
-    go True ks = do
-      writeSTRef cont ks
-      return ks
-    go False ks = return ks
+simplifyCont c = readSTRef (conts c)
+-- simplifyCont Conts {conts = cont} = readSTRef cont >>= go False
+--   where
+--     go !_ [Cont g (Pure f) args cont'] = do
+--       ks' <- simplifyCont cont'
+--       go True $ map (contraMapCont $ \b -> fmap f (g b) >>= args) ks'
+--     go True ks = do
+--       writeSTRef cont ks
+--       return ks
+--     go False ks = return ks
 
 -------------------------------------------------------------------------------
 -- * Grammars

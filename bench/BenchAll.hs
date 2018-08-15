@@ -7,9 +7,12 @@ import Control.DeepSeq
 import Criterion.Main
 import Data.Char
 import Data.Maybe
-import Text.Earley
+-- import Text.Earley
 import qualified Text.Parsec as Parsec
 import qualified Text.Parsec.Pos as Parsec
+import Text.Earley.Parser.Rewrite
+import Control.Monad.ST
+
 
 data Expr
   = Add Expr Expr
@@ -45,7 +48,7 @@ treeSum n = let a = n `div` 2 -- will be at least 1
 
 -- Earley parser
 
-expr :: Grammar r (Prod r String Token Expr)
+expr :: ST r (Parser r String [Token] Expr)
 expr = mdo
   x1 <- rule $ Add <$> x1 <* namedToken "+" <*> x2
             <|> x2
@@ -61,12 +64,13 @@ isIdent :: String -> Bool
 isIdent (x:_) = isAlpha x
 isIdent _     = False
 
-sepBy1 :: Prod r e t a -> Prod r e t op -> Grammar r (Prod r e t [a])
+sepBy1 :: Parser r e [t] a -> Parser r e [t] op -> ST r (Parser r e [t] [a])
 sepBy1 p op = mdo
-  ops <- rule $ pure [] <|> (:) <$ op <*> p <*> ops
-  rule $ (:) <$> p <*> ops
+  ops <- rule' $ pure [] <|> (:) <$ op <*> p <*> ops
+  rule' $ (:) <$> p <*> ops
+-- {-#  #-}
 
-expr' :: Grammar r (Prod r String Token Expr)
+expr' :: ST r (Parser r String [Token] Expr)
 expr' = mdo
   let var = Var <$> satisfy isIdent <|> token "(" *> mul <* token ")"
   mul <- fmap (foldl1 Mul) <$> add `sepBy1` token "*"
@@ -74,10 +78,10 @@ expr' = mdo
   return mul
 
 parseEarley :: [Token] -> Maybe Expr
-parseEarley input = listToMaybe (fst (fullParses (parser expr) input))
+parseEarley input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr) input))
 
 parseEarley' :: [Token] -> Maybe Expr
-parseEarley' input = listToMaybe (fst (fullParses (parser expr') input))
+parseEarley' input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr') input))
 
 -- Parsec parsec
 
@@ -124,18 +128,33 @@ linearInputs = map linearInput benchSizes
 treeInputs :: [(String, [Token])]
 treeInputs = map treeInput benchSizes
 
+veryAmbiguous :: ST r (Parser r Char String ())
+veryAmbiguous = mdo
+  s <- rule $ () <$ token 'b'
+           <|> () <$ s <* s
+          --  <|> () <$ s <* s <* s
+           <?> 's'
+  return s
+
+ambigTest n = bench (show n) $ nf (\i -> listToMaybe $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) i) (replicate n 'b')
+
 main :: IO ()
-main = do
-  evaluate (rnf linearInputs)
-  evaluate (rnf treeInputs)
-  defaultMain
-    [ -- bgroup "inputs" $ map inputBench linearInputs 
-      bgroup "earley" $ map earleyBench linearInputs
-    , bgroup "earley'" $ map earley'Bench linearInputs
-    , bgroup "parsec" $ map parsecBench linearInputs
-    -- , bgroup "inputsTree" $ map inputBench treeInputs
-    , bgroup "earleyTree" $ map earleyBench treeInputs
-    , bgroup "earley'Tree" $ map earley'Bench treeInputs
-    , bgroup "parsecTree" $ map parsecBench treeInputs
-    ]
+main = do 
+  -- evaluate (rnf linearInputs)
+  -- evaluate (rnf treeInputs)
+  -- print $ fullParses ((>>= id) $ liftST expr') (snd $ linearInput 10000)
+  -- pure ()
+  pure ()
+  defaultMain $ fmap ambigTest [5]
+
+
+  --   [ -- bgroup "inputs" $ map inputBench linearInputs 
+  --     bgroup "earley" $ map earleyBench linearInputs
+  --   , bgroup "earley'" $ map earley'Bench linearInputs
+  --   , bgroup "parsec" $ map parsecBench linearInputs
+  --   -- , bgroup "inputsTree" $ map inputBench treeInputs
+  --   , bgroup "earleyTree" $ map earleyBench treeInputs
+  --   , bgroup "earley'Tree" $ map earley'Bench treeInputs
+  --   , bgroup "parsecTree" $ map parsecBench treeInputs
+  --   ]
 

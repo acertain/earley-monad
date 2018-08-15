@@ -7,7 +7,7 @@ module Text.Earley
   , -- * Deprecated operators
     symbol, namedSymbol, word
   , -- * Parsing
-    Report(..), Parser.Result(..), Parser, parser, allParses, fullParses
+    Report(..), Parser, parser, allParses, fullParses
   , -- * Recognition
     report
   , -- * Language generation
