@@ -39,11 +39,11 @@ data State s e i = State {
 
 
 newtype Parser s e i a = Parser {
-  unParser :: (a -> M s e i) -> M s e i
+  unParser :: (Results s e i a -> M s e i) -> M s e i
 }
 
 liftST :: ST s a -> Parser s e i a
-liftST f = Parser $ \cb s -> f >>= flip cb s
+liftST f = Parser $ \cb s -> f >>= \x -> cb (Results $ \cb' -> cb' x) s
 {-# INLINE liftST #-}
 
 
@@ -58,14 +58,22 @@ liftST f = Parser $ \cb s -> f >>= flip cb s
 -- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults [a] [a -> M s e i]
 
--- so we reset results after done w/ pos when it is Just
-data RuleI s e i a = RuleI [a] [a -> M s e i]
+-- so we reset results after done w/ pos
+data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
 
 -- data Results s e i a where
 --   Results :: STRef s [a] -> STRef s [a -> State s e i -> ST s (State s e i)] -> Results s e i a
 
 
 newtype Results s e i a = Results ((a -> M s e i) -> M s e i)
+  -- deriving (Functor)
+
+instance Functor (Results s e i) where
+  fmap f (Results g) = Results (\cb -> g (cb . f))
+instance Applicative (Results s e i) where
+  pure x = Results (\cb -> cb x)
+  Results f <*> Results x = Results (\cb -> f (\f' -> x (\x' -> cb (f' x'))))
+  liftA2 f (Results x) (Results y) = Results (\cb -> x (\a -> y (\b -> cb (f a b))))
 
 -- FIXME: can merge results at same rule w/ diff start pos & same end pos!
 -- (if a calls b at pos i and j, and i-k & j-k both return results, only need to return once)
@@ -84,27 +92,42 @@ ruleP f = do
   -- check if callbacks list empty instead of isNothing
   currentRef <- newSTRef (Nothing :: Maybe (STRef s (RuleI s e i a)))
 
+  emptyResults <- newSTRef (undefined :: RuleResults s e i a)
+
   -- TODO: need to use weakrefs for GC
   let
     resetcb = writeSTRef currentRef Nothing
+    -- TODO: this is wrong, need to pass STRef (RuleResults) instead
+    -- so that this works when at future pos
+    results pos ref = Results $ \cb s -> do
+      RuleResults rs rcbs <- readSTRef ref
+      when (curPos s == pos) $ writeSTRef ref (RuleResults rs (cb:rcbs))
+      foldrM cb s rs
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
-          RuleI rs cbs <- readSTRef ref
-          writeSTRef ref (RuleI rs (cb:cbs))
-          foldrM cb st rs
+          RuleI r cbs <- readSTRef ref
+          writeSTRef ref (RuleI r (cb:cbs))
+          if r == emptyResults then pure st else cb (results (curPos st) r) st
         Nothing -> do
-          ref <- newSTRef (RuleI [] [cb])
+          ref <- newSTRef (RuleI emptyResults [cb])
           writeSTRef currentRef (Just ref)
           let
-            !startPos = curPos st
-            resetcb2 = modifySTRef ref (\(RuleI _ cbs) -> RuleI [] cbs)
-            resultcb x s = do
+            reset2 rs = do
+              modifySTRef ref (\(RuleI _ cbs) -> RuleI emptyResults cbs)
+              modifySTRef rs (\(RuleResults xs _) -> RuleResults xs undefined)
+            g x s = do
               RuleI rs cbs <- readSTRef ref
-              when (curPos s == startPos) $ writeSTRef ref (RuleI (x:rs) cbs)
-              -- traceM $ show $ length cbs
-              foldrM (\g -> g x) s cbs
-          unParser (f p) resultcb (st {reset = resetcb:resetcb2:reset st})
+              if rs == emptyResults
+                then do
+                  rs' <- newSTRef (RuleResults [x] [])
+                  writeSTRef ref (RuleI rs' cbs)
+                  foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s}) cbs
+                else do
+                  RuleResults rxs rcbs <- readSTRef rs
+                  writeSTRef rs (RuleResults (x:rxs) rcbs)
+                  foldrM ($ x) s rcbs
+          unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
 
 
@@ -114,23 +137,29 @@ fixP f = join $ liftST (ruleP f)
 rule' :: Parser s e i a -> ST s (Parser s e i a)
 rule' p = ruleP (\_ -> p)
 
+-- thin :: Parser s e i a -> Parser s e i ()
+-- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ ()))
+
 instance Functor (Parser s e i) where
-  fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f x))
+  fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f <$> x))
   {-# INLINE fmap #-}
 instance Applicative (Parser s e i) where
+  -- TODO: make this operate on list of results from the same position for time complexity
   (<*>) = ap
   {-# INLINE (<*>) #-}
   pure = return
   {-# INLINE pure #-}
-  liftA2 f (Parser a) (Parser b) = Parser $ \cb -> a (\x -> b (\y -> cb (f x y)))
+  liftA2 f (Parser a) (Parser b) = Parser $ \cb -> a (\x -> b (\y -> cb (liftA2 f x y)))
   {-# INLINE liftA2 #-}
+  -- TODO: do we want this? currently w/ results it only returns once
+  -- ((a <|> b) *> x) != (a *> x) <|> (b *> x)
+  -- if a & b both succeed the first will only have one result and the second will have two
   Parser a *> Parser b = Parser $ \cb -> a (\_ -> b cb)
   {-# INLINE (*>) #-}
 instance Monad (Parser s e i) where
-  return a = Parser $ \cb -> cb a
+  return a = Parser $ \cb -> cb $ pure a
   {-# INLINE return #-}
-  -- TODO: make this operate on list of results from the same position for time complexity
-  Parser p >>= f = Parser $ \cb -> p (\a -> unParser (f a) cb)
+  Parser p >>= f = Parser $ \cb -> p (\(Results a) -> a (\x -> unParser (f x) cb))
   {-# INLINE (>>=) #-}
 
 instance Alternative (Parser s e i) where
@@ -145,7 +174,7 @@ terminalP v = Parser $ \cb s -> case input s of
   [] -> pure s
   (x:_) -> case v x of
     Nothing -> pure s
-    Just a -> pure $ s {next = cb a:next s}
+    Just a -> pure $ s {next = cb (pure a):next s}
 -- {-# INLINE terminalP #-}
 
 
@@ -173,7 +202,7 @@ data Report e i = Report
 run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
 run keep p l = runST $ do
   results <- newSTRef ([] :: [(r,Int)])
-  s1 <- unParser p (\a s -> modifySTRef results ((a, curPos s):) >> pure s) (emptyState l)
+  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((a, curPos s):) >> pure s)) (emptyState l)
   let f s | null (next s) = do
             sequenceA_ (reset s)
             rs <- readSTRef results
