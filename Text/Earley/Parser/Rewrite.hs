@@ -1,4 +1,4 @@
-{-# LANGUAGE RankNTypes, GADTs #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
@@ -43,7 +43,7 @@ newtype Parser s e i a = Parser {
 }
 
 liftST :: ST s a -> Parser s e i a
-liftST f = Parser $ \cb s -> f >>= \x -> cb (Results $ \cb' -> cb' x) s
+liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 {-# INLINE liftST #-}
 
 
@@ -56,7 +56,7 @@ liftST f = Parser $ \cb s -> f >>= \x -> cb (Results $ \cb' -> cb' x) s
 -- maybe could w/ nulls transformation though
 
 -- TODO: could we store a [Results s e i a] here?
-data RuleResults s e i a = RuleResults [a] [a -> M s e i]
+data RuleResults s e i a = RuleResults [a] [[a] -> M s e i]
 
 -- so we reset results after done w/ pos
 data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
@@ -65,15 +65,14 @@ data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Resu
 --   Results :: STRef s [a] -> STRef s [a -> State s e i -> ST s (State s e i)] -> Results s e i a
 
 
-newtype Results s e i a = Results ((a -> M s e i) -> M s e i)
-  -- deriving (Functor)
+newtype Results s e i a = Results (([a] -> M s e i) -> M s e i)
 
 instance Functor (Results s e i) where
-  fmap f (Results g) = Results (\cb -> g (cb . f))
+  fmap f (Results g) = Results (\cb -> g (cb . fmap f))
 instance Applicative (Results s e i) where
-  pure x = Results (\cb -> cb x)
-  Results f <*> Results x = Results (\cb -> f (\f' -> x (\x' -> cb (f' x'))))
-  liftA2 f (Results x) (Results y) = Results (\cb -> x (\a -> y (\b -> cb (f a b))))
+  pure x = Results (\cb -> cb $ pure x)
+  Results f <*> Results x = Results (\cb -> f (\a -> x (\b -> cb (a <*> b))))
+  liftA2 f (Results x) (Results y) = Results (\cb -> x (\a -> y (\b -> cb (liftA2 f a b))))
 
 -- FIXME: can merge results at same rule w/ diff start pos & same end pos!
 -- (if a calls b at pos i and j, and i-k & j-k both return results, only need to return once)
@@ -82,6 +81,10 @@ instance Applicative (Results s e i) where
 -- what about alts tho? shouldn't matter, but i'm not sure
 
 -- TODO: gll-style optimization for multiple results at same position
+
+-- recover :: Parser s e i a -> ST s (Parser s e i a)
+-- recover p = do
+--   _
 
 -- NOTE: techincally this is two things in one (GLL (and us) merge them):
 -- 1. merge multiple `Result`s at same position (optimization, needed to be `O(n^3)`, speeds up `rule (\_ -> a <|> b) <*> c`)
@@ -94,15 +97,12 @@ ruleP f = do
 
   emptyResults <- newSTRef (undefined :: RuleResults s e i a)
 
-  -- TODO: need to use weakrefs for GC
   let
     resetcb = writeSTRef currentRef Nothing
-    -- TODO: this is wrong, need to pass STRef (RuleResults) instead
-    -- so that this works when at future pos
     results pos ref = Results $ \cb s -> do
       RuleResults rs rcbs <- readSTRef ref
       when (curPos s == pos) $ writeSTRef ref (RuleResults rs (cb:rcbs))
-      foldrM cb s rs
+      cb rs s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -120,12 +120,12 @@ ruleP f = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- newSTRef (RuleResults [x] [])
+                  rs' <- newSTRef (RuleResults x [])
                   writeSTRef ref (RuleI rs' cbs)
                   foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s}) cbs
                 else do
                   RuleResults rxs rcbs <- readSTRef rs
-                  writeSTRef rs (RuleResults (x:rxs) rcbs)
+                  writeSTRef rs (RuleResults (x ++ rxs) rcbs)
                   foldrM ($ x) s rcbs
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
@@ -137,15 +137,16 @@ fixP f = join $ liftST (ruleP f)
 rule' :: Parser s e i a -> ST s (Parser s e i a)
 rule' p = ruleP (\_ -> p)
 
--- thin :: Parser s e i a -> Parser s e i ()
--- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ ()))
+thin :: Parser s e i a -> Parser s e i ()
+thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ [()]))
 
 instance Functor (Parser s e i) where
   fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f <$> x))
   {-# INLINE fmap #-}
+  -- x <$ Parser a = Parser $ \cb -> a _
+  -- {-# INLINE (<$) #-}
 instance Applicative (Parser s e i) where
-  -- TODO: make this operate on list of results from the same position for time complexity
-  (<*>) = ap
+  Parser f <*> Parser a = Parser $ \cb -> f (\f' -> a (\a' -> cb (f' <*> a')))
   {-# INLINE (<*>) #-}
   pure = return
   {-# INLINE pure #-}
@@ -154,12 +155,13 @@ instance Applicative (Parser s e i) where
   -- TODO: do we want this? currently w/ results it only returns once
   -- ((a <|> b) *> x) != (a *> x) <|> (b *> x)
   -- if a & b both succeed the first will only have one result and the second will have two
-  Parser a *> Parser b = Parser $ \cb -> a (\_ -> b cb)
-  {-# INLINE (*>) #-}
+  -- Parser a *> Parser b = Parser $ \cb -> a (\_ -> b cb)
+  -- {-# INLINE (*>) #-}
 instance Monad (Parser s e i) where
-  return a = Parser $ \cb -> cb $ pure a
+  return a = Parser ($ pure a)
   {-# INLINE return #-}
-  Parser p >>= f = Parser $ \cb -> p (\(Results a) -> a (\x -> unParser (f x) cb))
+  Parser p >>= f = Parser $ \cb -> p (\(Results a) -> a (\xs s -> foldrM (\x -> unParser (f x) cb) s xs))
+  -- p (\(Results a) -> a (\x -> unParser (f x) cb))
   {-# INLINE (>>=) #-}
 
 instance Alternative (Parser s e i) where
@@ -202,7 +204,7 @@ data Report e i = Report
 run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
 run keep p l = runST $ do
   results <- newSTRef ([] :: [(r,Int)])
-  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((a, curPos s):) >> pure s)) (emptyState l)
+  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results (fmap (,curPos s) a++) >> pure s)) (emptyState l)
   let f s | null (next s) = do
             sequenceA_ (reset s)
             rs <- readSTRef results
