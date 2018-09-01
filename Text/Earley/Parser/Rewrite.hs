@@ -13,17 +13,6 @@ import Text.Earley.Grammar
 
 import Debug.Trace
 
--- if you want a lazy list of results, earley is the wrong algorithm
--- use gll instead. gll is like earley but it doesn't process the 
--- input one character at a time and instead keeps a
--- [(start pos,[(end pos,result)])] for each rule
--- and doesn't need to run all rules in lockstep on the input, 
--- so it can be more lazy, but it uses more memory (/can't gc intermediate results)
-
--- earley is fine if you want all results or your grammar isn't that ambiguous
-
--- (if you want a list of results, earlier results first, earley can do that)
-
 type M s e i = State s e i -> ST s (State s e i)
 
 -- TODO: more stuff here
@@ -47,24 +36,12 @@ liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 {-# INLINE liftST #-}
 
 
--- TODO: so we reset cb but not results after we're done with start pos
--- (and store a RuleResults per end pos w/ results, reset RuleResults in RuleI after done w/ pos)
-
 -- could we s/[a]/a/ on Results? idk if it affects time complexity, but the user really should be able to get an [a]
 -- maybe we can use some lazy IO trick to give the user a complete [a]? 
 -- problem is if left recursion + user getting list. so we can't give the user a complete [a]
 -- maybe could w/ nulls transformation though
 
--- TODO: could we store a [Results s e i a] here?
-data RuleResults s e i a = RuleResults [a] [[a] -> M s e i]
-
--- so we reset results after done w/ pos
-data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
-
--- data Results s e i a where
---   Results :: STRef s [a] -> STRef s [a -> State s e i -> ST s (State s e i)] -> Results s e i a
-
-
+-- TODO: no reason to use [a] here if we aren't merging results
 newtype Results s e i a = Results (([a] -> M s e i) -> M s e i)
 
 instance Functor (Results s e i) where
@@ -80,11 +57,13 @@ instance Applicative (Results s e i) where
 -- i.e. it must be that `a = b <*> c`, but `c` must be a rule, which does the merging for us
 -- what about alts tho? shouldn't matter, but i'm not sure
 
--- TODO: gll-style optimization for multiple results at same position
-
 -- recover :: Parser s e i a -> ST s (Parser s e i a)
 -- recover p = do
 --   _
+
+data RuleResults s e i a = RuleResults [Results s e i a] [[a] -> M s e i]
+
+data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
 
 -- NOTE: techincally this is two things in one (GLL (and us) merge them):
 -- 1. merge multiple `Result`s at same position (optimization, needed to be `O(n^3)`, speeds up `rule (\_ -> a <|> b) <*> c`)
@@ -92,7 +71,6 @@ instance Applicative (Results s e i) where
 ruleP :: (Parser s e i a -> Parser s e i a) -> ST s (Parser s e i a)
 ruleP f = do
   -- TODO: remove the Maybe, just use an empty RuleI
-  -- check if callbacks list empty instead of isNothing
   currentRef <- newSTRef (Nothing :: Maybe (STRef s (RuleI s e i a)))
 
   emptyResults <- newSTRef (undefined :: RuleResults s e i a)
@@ -102,7 +80,7 @@ ruleP f = do
     results pos ref = Results $ \cb s -> do
       RuleResults rs rcbs <- readSTRef ref
       when (curPos s == pos) $ writeSTRef ref (RuleResults rs (cb:rcbs))
-      cb rs s
+      foldrM (\x -> case x of Results go -> go cb) s rs
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -120,19 +98,19 @@ ruleP f = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- newSTRef (RuleResults x [])
+                  rs' <- newSTRef (RuleResults [x] [])
                   writeSTRef ref (RuleI rs' cbs)
                   foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s}) cbs
                 else do
                   RuleResults rxs rcbs <- readSTRef rs
-                  writeSTRef rs (RuleResults (x ++ rxs) rcbs)
-                  foldrM ($ x) s rcbs
-          unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
+                  writeSTRef rs (RuleResults (x:rxs) rcbs)
+                  foldrM (\c -> case x of Results go -> go c) s rcbs
+          unParser (f p) g (st {reset = resetcb:reset st})
   pure p
 
 
-fixP :: (Parser s e i a -> Parser s e i a) -> Parser s e i a
-fixP f = join $ liftST (ruleP f)
+-- fixP :: (Parser s e i a -> Parser s e i a) -> Parser s e i a
+-- fixP f = join $ liftST (ruleP f)
 
 rule' :: Parser s e i a -> ST s (Parser s e i a)
 rule' p = ruleP (\_ -> p)
@@ -148,20 +126,21 @@ instance Functor (Parser s e i) where
 instance Applicative (Parser s e i) where
   Parser f <*> Parser a = Parser $ \cb -> f (\f' -> a (\a' -> cb (f' <*> a')))
   {-# INLINE (<*>) #-}
-  pure = return
+  pure a = Parser ($ pure a)
   {-# INLINE pure #-}
   liftA2 f (Parser a) (Parser b) = Parser $ \cb -> a (\x -> b (\y -> cb (liftA2 f x y)))
   {-# INLINE liftA2 #-}
-  -- TODO: do we want this? currently w/ results it only returns once
-  -- ((a <|> b) *> x) != (a *> x) <|> (b *> x)
-  -- if a & b both succeed the first will only have one result and the second will have two
-  -- Parser a *> Parser b = Parser $ \cb -> a (\_ -> b cb)
+  -- this is old, currently we aren't merging results so this doesn't matter
+  -- -- TODO: do we want this? currently w/ results it only returns once
+  -- -- ((a <|> b) *> x) != (a *> x) <|> (b *> x)
+  -- -- if a & b both succeed the first will only have one result and the second will have two
+  -- -- Parser a *> Parser b = Parser $ \cb -> a (\_ -> b cb)
+  -- -- 
   -- {-# INLINE (*>) #-}
 instance Monad (Parser s e i) where
-  return a = Parser ($ pure a)
+  return = pure
   {-# INLINE return #-}
   Parser p >>= f = Parser $ \cb -> p (\(Results a) -> a (\xs s -> foldrM (\x -> unParser (f x) cb) s xs))
-  -- p (\(Results a) -> a (\x -> unParser (f x) cb))
   {-# INLINE (>>=) #-}
 
 instance Alternative (Parser s e i) where
@@ -201,18 +180,17 @@ data Report e i = Report
                       -- which may be empty.
   } deriving (Eq, Ord, Read, Show)
 
-run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
-run keep p l = runST $ do
-  results <- newSTRef ([] :: [(r,Int)])
-  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results (fmap (,curPos s) a++) >> pure s)) (emptyState l)
+run :: Bool -> Parser s e [a] r -> [a] -> ST s ([(r, Int)], Report e [a])
+run keep p l = do
+  results <- newSTRef ([] :: [(Results s e [a] r,Int)])
+  s1 <- unParser p (\rs s -> modifySTRef results ((rs,curPos s):) >> pure s) (emptyState l)
   let f s | null (next s) = do
             sequenceA_ (reset s)
-            rs <- readSTRef results
-            pure (rs, Report {
+            pure $ Report {
               position = curPos s,
               expected = names s,
               unconsumed = input s
-            })
+            }
           | otherwise = do
             sequenceA_ (reset s)
             unless keep $ writeSTRef results []
@@ -223,7 +201,13 @@ run keep p l = runST $ do
               names = [],
               reset = []}) (next s)
             f s'
-  f s1
+  r <- f s1
+  traceM "done parsing, building results now"
+  rs2 <- newSTRef ([] :: [(r,Int)])
+  -- TODO: this is possibly exponential,
+  -- need to do something to return a lazy list or such
+  readSTRef results >>= traverse_ (\(Results rs, pos) -> rs (\x s -> modifySTRef rs2 (fmap (,pos) x++) >> pure s) ((emptyState l) {curPos = position r + 1}))
+  (,r) <$> readSTRef rs2
 
 named :: Parser s e i a -> e -> Parser s e i a
 named (Parser p) e = Parser $ \cb s -> p cb (s{names = e:names s})
@@ -260,16 +244,16 @@ parser g = join $ liftST $ fmap interpProd $ interpGrammar g
 {-# INLINE parser #-}
 
 allParses :: (forall s. Parser s e [t] a) -> [t] -> ([(a,Int)],Report e [t])
-allParses p i = run True p i
+allParses p i = runST $ run True p i
 
 fullParses :: (forall s. Parser s e [t] a) -> [t] -> ([a],Report e [t])
-fullParses p i = first (fmap fst) $ run False p i
+fullParses p i = first (fmap fst) $ runST $ run False p i
 
 -- | See e.g. how far the parser is able to parse the input string before it
 -- fails.  This can be much faster than getting the parse results for highly
 -- ambiguous grammars.
 report :: (forall s. Parser s e [t] a) -> [t] -> Report e [t]
-report p i = snd $ run False p i
+report p i = snd $ runST $ run False p i
 
 -- ident (x:_) = isAlpha x
 -- ident _     = False
