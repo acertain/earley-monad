@@ -115,8 +115,13 @@ ruleP f = do
 rule' :: Parser s e i a -> ST s (Parser s e i a)
 rule' p = ruleP (\_ -> p)
 
-thin :: Parser s e i a -> Parser s e i ()
-thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ [()]))
+bindList :: Parser s e i a -> ([a] -> Parser s e i b) -> Parser s e i b
+bindList (Parser p) f = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f l) cb))
+
+thin = flip bindList (\_ -> pure ())
+
+-- thin :: Parser s e i a -> Parser s e i ()
+-- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ [()]))
 
 instance Functor (Parser s e i) where
   fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f <$> x))
