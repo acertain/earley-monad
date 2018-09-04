@@ -77,11 +77,11 @@ expr' = mdo
   add <- fmap (foldl1 Add) <$> var `sepBy1` token "+"
   return mul
 
-parseEarley :: [Token] -> Maybe Expr
-parseEarley input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr) input))
+-- parseEarley :: [Token] -> Maybe Expr
+-- parseEarley input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr) input))
 
-parseEarley' :: [Token] -> Maybe Expr
-parseEarley' input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr') input))
+-- parseEarley' :: [Token] -> Maybe Expr
+-- parseEarley' input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr') input))
 
 -- Parsec parsec
 
@@ -110,11 +110,11 @@ treeInput size = (show size, tokenExpr 0 $ treeSum size)
 inputBench :: (String, [Token]) -> Benchmark
 inputBench (name, input) = bench name $ nf id input
 
-earleyBench :: (String, [Token]) -> Benchmark
-earleyBench (name, input) = bench name $ nf parseEarley input
+-- earleyBench :: (String, [Token]) -> Benchmark
+-- earleyBench (name, input) = bench name $ nf parseEarley input
 
-earley'Bench :: (String, [Token]) -> Benchmark
-earley'Bench (name, input) = bench name $ nf parseEarley' input
+-- earley'Bench :: (String, [Token]) -> Benchmark
+-- earley'Bench (name, input) = bench name $ nf parseEarley' input
 
 parsecBench :: (String, [Token]) -> Benchmark
 parsecBench (name, input) = bench name $ nf parseParsec input
@@ -130,24 +130,25 @@ treeInputs = map treeInput benchSizes
 
 veryAmbiguous :: ST r (Parser r Char String ())
 veryAmbiguous = mdo
-  s <- rule $ () <$ token 'b'
+  s <- rule $ thin $
+               () <$ token 'b'
            <|> () <$ s <* s
           --  <|> () <$ s <* s <* s
-           <?> 's'
+          --  <?> 's'
   return s
 
 ambigTest n = bench (show n) $ nf (\i -> listToMaybe $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) i) (replicate n 'b')
 
 main :: IO ()
 main = do 
-  -- evaluate (rnf linearInputs)
-  -- evaluate (rnf treeInputs)
-  -- print $ fullParses ((>>= id) $ liftST expr') (snd $ linearInput 10000)
-  -- pure ()
-  pure ()
-  defaultMain $ fmap ambigTest [5]
+  -- -- evaluate (rnf linearInputs)
+  -- -- evaluate (rnf treeInputs)
+  print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 22 'b')
+  -- -- pure ()
+  -- -- pure ()
+  -- defaultMain $ fmap ambigTest [6..14]
 
-
+  -- defaultMain
   --   [ -- bgroup "inputs" $ map inputBench linearInputs 
   --     bgroup "earley" $ map earleyBench linearInputs
   --   , bgroup "earley'" $ map earley'Bench linearInputs

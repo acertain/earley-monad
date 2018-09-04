@@ -41,6 +41,9 @@ liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 -- problem is if left recursion + user getting list. so we can't give the user a complete [a]
 -- maybe could w/ nulls transformation though
 
+-- TODO: could we store a [Results s e i a] here?
+data RuleResults s e i a = RuleResults [a] [[a] -> M s e i]
+
 -- TODO: no reason to use [a] here if we aren't merging results
 newtype Results s e i a = Results (([a] -> M s e i) -> M s e i)
 
@@ -61,8 +64,6 @@ instance Applicative (Results s e i) where
 -- recover p = do
 --   _
 
-data RuleResults s e i a = RuleResults [Results s e i a] [[a] -> M s e i]
-
 data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
 
 -- NOTE: techincally this is two things in one (GLL (and us) merge them):
@@ -80,7 +81,7 @@ ruleP f = do
     results pos ref = Results $ \cb s -> do
       RuleResults rs rcbs <- readSTRef ref
       when (curPos s == pos) $ writeSTRef ref (RuleResults rs (cb:rcbs))
-      foldrM (\x -> case x of Results go -> go cb) s rs
+      cb rs s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -98,14 +99,14 @@ ruleP f = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- newSTRef (RuleResults [x] [])
+                  rs' <- newSTRef (RuleResults x [])
                   writeSTRef ref (RuleI rs' cbs)
                   foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s}) cbs
                 else do
                   RuleResults rxs rcbs <- readSTRef rs
-                  writeSTRef rs (RuleResults (x:rxs) rcbs)
-                  foldrM (\c -> case x of Results go -> go c) s rcbs
-          unParser (f p) g (st {reset = resetcb:reset st})
+                  writeSTRef rs (RuleResults (x ++ rxs) rcbs)
+                  foldrM ($ x) s rcbs
+          unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
 
 
@@ -118,6 +119,13 @@ rule' p = ruleP (\_ -> p)
 bindList :: Parser s e i a -> ([a] -> Parser s e i b) -> Parser s e i b
 bindList (Parser p) f = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f l) cb))
 
+-- fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
+-- fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g [f l])))
+-- {-# INLINE fmapList #-}
+
+thin :: Parser s e i a -> Parser s e i ()
+-- thin = fmapList (\_ -> ())
+-- {-# INLINE thin #-}
 thin = flip bindList (\_ -> pure ())
 
 -- thin :: Parser s e i a -> Parser s e i ()
@@ -185,17 +193,18 @@ data Report e i = Report
                       -- which may be empty.
   } deriving (Eq, Ord, Read, Show)
 
-run :: Bool -> Parser s e [a] r -> [a] -> ST s ([(r, Int)], Report e [a])
-run keep p l = do
-  results <- newSTRef ([] :: [(Results s e [a] r,Int)])
-  s1 <- unParser p (\rs s -> modifySTRef results ((rs,curPos s):) >> pure s) (emptyState l)
+run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
+run keep p l = runST $ do
+  results <- newSTRef ([] :: [(r,Int)])
+  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results (fmap (,curPos s) a++) >> pure s)) (emptyState l)
   let f s | null (next s) = do
             sequenceA_ (reset s)
-            pure $ Report {
+            rs <- readSTRef results
+            pure (rs, Report {
               position = curPos s,
               expected = names s,
               unconsumed = input s
-            }
+            })
           | otherwise = do
             sequenceA_ (reset s)
             unless keep $ writeSTRef results []
@@ -206,13 +215,7 @@ run keep p l = do
               names = [],
               reset = []}) (next s)
             f s'
-  r <- f s1
-  traceM "done parsing, building results now"
-  rs2 <- newSTRef ([] :: [(r,Int)])
-  -- TODO: this is possibly exponential,
-  -- need to do something to return a lazy list or such
-  readSTRef results >>= traverse_ (\(Results rs, pos) -> rs (\x s -> modifySTRef rs2 (fmap (,pos) x++) >> pure s) ((emptyState l) {curPos = position r + 1}))
-  (,r) <$> readSTRef rs2
+  f s1
 
 named :: Parser s e i a -> e -> Parser s e i a
 named (Parser p) e = Parser $ \cb s -> p cb (s{names = e:names s})
@@ -249,16 +252,16 @@ parser g = join $ liftST $ fmap interpProd $ interpGrammar g
 {-# INLINE parser #-}
 
 allParses :: (forall s. Parser s e [t] a) -> [t] -> ([(a,Int)],Report e [t])
-allParses p i = runST $ run True p i
+allParses p i = run True p i
 
 fullParses :: (forall s. Parser s e [t] a) -> [t] -> ([a],Report e [t])
-fullParses p i = first (fmap fst) $ runST $ run False p i
+fullParses p i = first (fmap fst) $ run False p i
 
 -- | See e.g. how far the parser is able to parse the input string before it
 -- fails.  This can be much faster than getting the parse results for highly
 -- ambiguous grammars.
 report :: (forall s. Parser s e [t] a) -> [t] -> Report e [t]
-report p i = snd $ runST $ run False p i
+report p i = snd $ run False p i
 
 -- ident (x:_) = isAlpha x
 -- ident _     = False
