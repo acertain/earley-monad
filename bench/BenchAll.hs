@@ -143,10 +143,10 @@ main :: IO ()
 main = do 
   -- -- evaluate (rnf linearInputs)
   -- -- evaluate (rnf treeInputs)
-  print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 22 'b')
+  -- print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 22 'b')
   -- -- pure ()
   -- -- pure ()
-  -- defaultMain $ fmap ambigTest [6..14]
+  defaultMain $ fmap ambigTest [11..18]
 
   -- defaultMain
   --   [ -- bgroup "inputs" $ map inputBench linearInputs 
