@@ -11,6 +11,8 @@ import Control.Monad.Fix
 import Control.Arrow
 import Text.Earley.Grammar
 
+import qualified Data.Sequence as S
+
 import Debug.Trace
 
 type M s e i = State s e i -> ST s (State s e i)
@@ -42,10 +44,10 @@ liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 -- maybe could w/ nulls transformation though
 
 -- TODO: could we store a [Results s e i a] here?
-data RuleResults s e i a = RuleResults [a] [[a] -> M s e i]
+data RuleResults s e i a = RuleResults (S.Seq a) [S.Seq a -> M s e i]
 
 -- TODO: no reason to use [a] here if we aren't merging results
-newtype Results s e i a = Results (([a] -> M s e i) -> M s e i)
+newtype Results s e i a = Results ((S.Seq a -> M s e i) -> M s e i)
 
 instance Functor (Results s e i) where
   fmap f (Results g) = Results (\cb -> g (cb . fmap f))
@@ -104,7 +106,7 @@ ruleP f = do
                   foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s}) cbs
                 else do
                   RuleResults rxs rcbs <- readSTRef rs
-                  writeSTRef rs (RuleResults (x ++ rxs) rcbs)
+                  writeSTRef rs (RuleResults (x <> rxs) rcbs)
                   foldrM ($ x) s rcbs
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
@@ -117,7 +119,7 @@ rule' :: Parser s e i a -> ST s (Parser s e i a)
 rule' p = ruleP (\_ -> p)
 
 bindList :: Parser s e i a -> ([a] -> Parser s e i b) -> Parser s e i b
-bindList (Parser p) f = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f l) cb))
+bindList (Parser p) f = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
 
 -- fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
 -- fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g [f l])))
@@ -196,7 +198,7 @@ data Report e i = Report
 run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
 run keep p l = runST $ do
   results <- newSTRef ([] :: [(r,Int)])
-  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results (fmap (,curPos s) a++) >> pure s)) (emptyState l)
+  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results (fmap (,curPos s) (toList a)++) >> pure s)) (emptyState l)
   let f s | null (next s) = do
             sequenceA_ (reset s)
             rs <- readSTRef results
