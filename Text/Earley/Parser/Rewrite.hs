@@ -118,8 +118,8 @@ ruleP f = do
 rule' :: Parser s e i a -> ST s (Parser s e i a)
 rule' p = ruleP (\_ -> p)
 
-bindList :: Parser s e i a -> ([a] -> Parser s e i b) -> Parser s e i b
-bindList (Parser p) f = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
+bindList :: ([a] -> Parser s e i b) -> Parser s e i a -> Parser s e i b
+bindList f (Parser p) = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
 
 -- fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
 -- fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g [f l])))
@@ -127,8 +127,8 @@ bindList (Parser p) f = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f 
 
 thin :: Parser s e i a -> Parser s e i ()
 -- thin = fmapList (\_ -> ())
+thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
-thin = flip bindList (\_ -> pure ())
 
 -- thin :: Parser s e i a -> Parser s e i ()
 -- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ [()]))
