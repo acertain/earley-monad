@@ -57,8 +57,9 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 
 -- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults {
-  processed :: S.Seq a,
-  unprocessed :: S.Seq a,
+  -- just a little bit of strictness reduces memory usage
+  processed :: !(S.Seq a),
+  unprocessed :: !(S.Seq a),
   callbacks :: ![S.Seq a -> M s e i]
 }
 
@@ -124,13 +125,13 @@ ruleP f = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- newSTRef (RuleResults [] x [])
-                  writeSTRef ref (RuleI rs' cbs)
-                  foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}) cbs
+                  rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults [] x [])
+                  writeSTRef ref ({-# SCC "g_ref" #-} RuleI rs' cbs)
+                  foldrM ($ results (curPos s) rs') ({-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}) cbs
                 else do
                   res <- readSTRef rs
-                  writeSTRef rs $ res { unprocessed = x <> unprocessed res }
-                  pure $ s { here = {-# SCC "g_append" #-} push (recheck rs) (here s) }
+                  writeSTRef rs $ {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res }
+                  pure $  {-# SCC "g_s" #-} s { here = {-# SCC "g_append" #-} push (recheck rs) (here s) }
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
 
