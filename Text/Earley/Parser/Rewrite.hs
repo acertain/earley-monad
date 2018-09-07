@@ -22,7 +22,7 @@ data State s e i = State {
   reset :: ![ST s ()],
   next :: ![M s e i],
   -- actions to process once we're done at current position but before next position
-  here :: S.Seq (M s e i),
+  here :: !(Queue (M s e i)),
   curPos :: {-# UNPACK #-} !Int,
   input :: i,
   names :: [e]
@@ -40,7 +40,7 @@ liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 {-# INLINE liftST #-}
 
 
-data Queue a = Queue [a] [a]
+data Queue a = Queue ![a] ![a]
 
 push :: a -> Queue a -> Queue a
 push a (Queue x y) = Queue (a:x) y
@@ -59,7 +59,7 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 data RuleResults s e i a = RuleResults {
   processed :: S.Seq a,
   unprocessed :: S.Seq a,
-  callbacks :: [S.Seq a -> M s e i]
+  callbacks :: ![S.Seq a -> M s e i]
 }
 
 -- TODO: no reason to use [a] here if we aren't merging results
@@ -113,7 +113,6 @@ ruleP f = do
             reset2 rs = do
               modifySTRef ref (\(RuleI _ cbs) -> RuleI emptyResults cbs)
               modifySTRef rs (\(RuleResults xs [] _) -> RuleResults xs [] undefined)
-              -- modifySTRef rs (\(RuleResults xs _) -> RuleResults xs undefined)
             recheck ref s = do
               rs <- readSTRef ref
               let xs = unprocessed rs
@@ -127,11 +126,11 @@ ruleP f = do
                 then do
                   rs' <- newSTRef (RuleResults [] x [])
                   writeSTRef ref (RuleI rs' cbs)
-                  foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s, here = here s <> [recheck rs']}) cbs
+                  foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}) cbs
                 else do
                   res <- readSTRef rs
                   writeSTRef rs $ res { unprocessed = x <> unprocessed res }
-                  pure $ s { here = {-# SCC "g_append" #-} here s <> [recheck rs] }
+                  pure $ s { here = {-# SCC "g_append" #-} push (recheck rs) (here s) }
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
 
@@ -205,7 +204,7 @@ emptyState i = State {
   curPos = 0,
   input = i,
   names = [],
-  here = []
+  here = Queue [] []
 }
 
 -- | A parsing report, which contains fields that are useful for presenting
@@ -239,15 +238,15 @@ run keep p l = runST $ do
               next = [],
               input = tail $ input s,
               -- TODO: don't use a linked list for this, mb like std::vector, & do fifo
-              here = S.fromList $ next s,
+              here = Queue [] $ reverse $ next s,
               curPos = curPos s + 1,
               names = [],
               reset = []
             }
             where
-              go s = case here s of
-                x S.:<| xs -> x (s { here = xs }) >>= go
-                [] -> f s
+              go s = case pop (here s) of
+                Just (x, xs) -> x (s { here = xs }) >>= go
+                Nothing -> f s
   f s1
 
 named :: Parser s e i a -> e -> Parser s e i a
