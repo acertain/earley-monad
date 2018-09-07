@@ -1,4 +1,4 @@
-{-# LANGUAGE RankNTypes, GADTs, TupleSections #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
@@ -21,6 +21,8 @@ type M s e i = State s e i -> ST s (State s e i)
 data State s e i = State {
   reset :: ![ST s ()],
   next :: ![M s e i],
+  -- actions to process once we're done at current position but before next position
+  here :: S.Seq (M s e i),
   curPos :: {-# UNPACK #-} !Int,
   input :: i,
   names :: [e]
@@ -38,13 +40,27 @@ liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 {-# INLINE liftST #-}
 
 
+data Queue a = Queue [a] [a]
+
+push :: a -> Queue a -> Queue a
+push a (Queue x y) = Queue (a:x) y
+
+pop :: Queue a -> Maybe (a, Queue a)
+pop (Queue [] []) = Nothing
+pop (Queue x []) = pop $ Queue [] (reverse x)
+pop (Queue x (y:ys)) = Just (y, Queue x ys)
+
 -- could we s/[a]/a/ on Results? idk if it affects time complexity, but the user really should be able to get an [a]
 -- maybe we can use some lazy IO trick to give the user a complete [a]? 
 -- problem is if left recursion + user getting list. so we can't give the user a complete [a]
 -- maybe could w/ nulls transformation though
 
 -- TODO: could we store a [Results s e i a] here?
-data RuleResults s e i a = RuleResults (S.Seq a) [S.Seq a -> M s e i]
+data RuleResults s e i a = RuleResults {
+  processed :: S.Seq a,
+  unprocessed :: S.Seq a,
+  callbacks :: [S.Seq a -> M s e i]
+}
 
 -- TODO: no reason to use [a] here if we aren't merging results
 newtype Results s e i a = Results ((S.Seq a -> M s e i) -> M s e i)
@@ -77,13 +93,13 @@ ruleP f = do
   currentRef <- newSTRef (Nothing :: Maybe (STRef s (RuleI s e i a)))
 
   emptyResults <- newSTRef (undefined :: RuleResults s e i a)
-
   let
     resetcb = writeSTRef currentRef Nothing
     results pos ref = Results $ \cb s -> do
-      RuleResults rs rcbs <- readSTRef ref
-      when (curPos s == pos) $ writeSTRef ref (RuleResults rs (cb:rcbs))
-      cb rs s
+      res <- readSTRef ref
+      -- RuleResults rs rcbs <- readSTRef ref
+      when (curPos s == pos) $ writeSTRef ref $ res { callbacks = cb:callbacks res }
+      cb (processed res) s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -96,18 +112,26 @@ ruleP f = do
           let
             reset2 rs = do
               modifySTRef ref (\(RuleI _ cbs) -> RuleI emptyResults cbs)
-              modifySTRef rs (\(RuleResults xs _) -> RuleResults xs undefined)
+              modifySTRef rs (\(RuleResults xs [] _) -> RuleResults xs [] undefined)
+              -- modifySTRef rs (\(RuleResults xs _) -> RuleResults xs undefined)
+            recheck ref s = do
+              rs <- readSTRef ref
+              let xs = unprocessed rs
+              if null xs then pure s else do
+                -- traceM $ show $ length xs
+                writeSTRef ref $ rs { unprocessed = [], processed = xs <> processed rs }
+                foldrM ($ xs) s $ callbacks rs
             g x s = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- newSTRef (RuleResults x [])
+                  rs' <- newSTRef (RuleResults [] x [])
                   writeSTRef ref (RuleI rs' cbs)
-                  foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s}) cbs
+                  foldrM ($ results (curPos s) rs') (s {reset = reset2 rs':reset s, here = here s <> [recheck rs']}) cbs
                 else do
-                  RuleResults rxs rcbs <- readSTRef rs
-                  writeSTRef rs (RuleResults (x <> rxs) rcbs)
-                  foldrM ($ x) s rcbs
+                  res <- readSTRef rs
+                  writeSTRef rs $ res { unprocessed = x <> unprocessed res }
+                  pure $ s { here = {-# SCC "g_append" #-} here s <> [recheck rs] }
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
 
@@ -121,8 +145,8 @@ rule' p = ruleP (\_ -> p)
 bindList :: ([a] -> Parser s e i b) -> Parser s e i a -> Parser s e i b
 bindList f (Parser p) = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
 
--- fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
--- fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g [f l])))
+fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
+fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g [f $ toList l])))
 -- {-# INLINE fmapList #-}
 
 thin :: Parser s e i a -> Parser s e i ()
@@ -180,7 +204,8 @@ emptyState i = State {
   next = [],
   curPos = 0,
   input = i,
-  names = []
+  names = [],
+  here = []
 }
 
 -- | A parsing report, which contains fields that are useful for presenting
@@ -197,12 +222,12 @@ data Report e i = Report
 
 run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
 run keep p l = runST $ do
-  results <- newSTRef ([] :: [(r,Int)])
-  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results (fmap (,curPos s) (toList a)++) >> pure s)) (emptyState l)
+  results <- newSTRef ([] :: [([r],Int)])
+  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((toList a,curPos s):) >> pure s)) (emptyState l)
   let f s | null (next s) = do
             sequenceA_ (reset s)
             rs <- readSTRef results
-            pure (rs, Report {
+            pure (rs >>= (\(r,l) -> (,l) <$> r), Report {
               position = curPos s,
               expected = names s,
               unconsumed = input s
@@ -210,13 +235,19 @@ run keep p l = runST $ do
           | otherwise = do
             sequenceA_ (reset s)
             unless keep $ writeSTRef results []
-            s' <- foldr (\a x -> x >>= a) (pure $ s {
+            go $ s {
               next = [],
               input = tail $ input s,
+              -- TODO: don't use a linked list for this, mb like std::vector, & do fifo
+              here = S.fromList $ next s,
               curPos = curPos s + 1,
               names = [],
-              reset = []}) (next s)
-            f s'
+              reset = []
+            }
+            where
+              go s = case here s of
+                x S.:<| xs -> x (s { here = xs }) >>= go
+                [] -> f s
   f s1
 
 named :: Parser s e i a -> e -> Parser s e i a
