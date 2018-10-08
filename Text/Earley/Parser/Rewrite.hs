@@ -1,7 +1,8 @@
-{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
+import Control.Monad.ST.Unsafe
 -- import Control.Monad.Trans
 import Data.STRef
 import Control.Monad
@@ -11,7 +12,9 @@ import Control.Monad.Fix
 import Control.Arrow
 import Text.Earley.Grammar
 
+
 import qualified Data.Sequence as S
+import GHC.Stack
 
 import Debug.Trace
 
@@ -57,10 +60,9 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 
 -- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults {
-  -- just a little bit of strictness reduces memory usage
-  processed :: !(S.Seq a),
-  unprocessed :: !(S.Seq a),
-  callbacks :: ![S.Seq a -> M s e i]
+  processed :: (S.Seq a),
+  unprocessed :: (S.Seq a),
+  callbacks :: [S.Seq a -> M s e i]
 }
 
 -- TODO: no reason to use [a] here if we aren't merging results
@@ -85,6 +87,11 @@ instance Applicative (Results s e i) where
 
 data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
 
+printStack :: HasCallStack => a -> IO ()
+printStack a = do
+  stack <- ccsToStrings =<< getCurrentCCS a
+  putStrLn $ renderStack stack
+
 -- NOTE: techincally this is two things in one (GLL (and us) merge them):
 -- 1. merge multiple `Result`s at same position (optimization, needed to be `O(n^3)`, speeds up `rule (\_ -> a <|> b) <*> c`)
 -- 2. cps processing for start position, to deal with left recursion
@@ -96,11 +103,11 @@ ruleP f = do
   emptyResults <- newSTRef (undefined :: RuleResults s e i a)
   let
     resetcb = writeSTRef currentRef Nothing
-    results pos ref = Results $ \cb s -> do
+    results !pos ref = Results $ \cb s -> do
       res <- readSTRef ref
       -- RuleResults rs rcbs <- readSTRef ref
       when (curPos s == pos) $ writeSTRef ref $ res { callbacks = cb:callbacks res }
-      cb (processed res) s
+      if null $ processed res then pure s else cb (processed res) s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -112,13 +119,16 @@ ruleP f = do
           writeSTRef currentRef (Just ref)
           let
             reset2 rs = do
-              modifySTRef ref (\(RuleI _ cbs) -> RuleI emptyResults cbs)
-              modifySTRef rs (\(RuleResults xs [] _) -> RuleResults xs [] undefined)
+              modifySTRef ({-# SCC "reset2_ref" #-} ref) (\(RuleI _ cbs) -> RuleI emptyResults cbs)
+              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs [] _) -> RuleResults xs [] undefined)
+              -- traceM $ "reset from: " <> (show $ curPos st)
+              -- unsafeIOToST $ printStack "a"
+              pure ()
             recheck ref s = do
               rs <- readSTRef ref
               let xs = unprocessed rs
-              if null xs then pure s else do
-                -- traceM $ show $ length xs
+              if null xs then pure s else {-# SCC "propagate" #-} do
+                -- traceM "propagate"
                 writeSTRef ref $ rs { unprocessed = [], processed = xs <> processed rs }
                 foldrM ($ xs) s $ callbacks rs
             g x s = do
@@ -127,11 +137,13 @@ ruleP f = do
                 then do
                   rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults [] x [])
                   writeSTRef ref ({-# SCC "g_ref" #-} RuleI rs' cbs)
+                  -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
                   foldrM ($ results (curPos s) rs') ({-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}) cbs
                 else do
                   res <- readSTRef rs
                   writeSTRef rs $ {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res }
-                  pure $  {-# SCC "g_s" #-} s { here = {-# SCC "g_append" #-} push (recheck rs) (here s) }
+                  pure $ {-# SCC "g_s" #-} s { here = {-# SCC "g_append" #-} push (recheck rs) (here s) }
+          -- traceM $ show $ curPos st
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
 
@@ -150,8 +162,8 @@ fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> 
 -- {-# INLINE fmapList #-}
 
 thin :: Parser s e i a -> Parser s e i ()
--- thin = fmapList (\_ -> ())
-thin = bindList (\_ -> pure ())
+thin = fmapList (\_ -> ())
+-- thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
 
 -- thin :: Parser s e i a -> Parser s e i ()
@@ -224,7 +236,10 @@ run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
 run keep p l = runST $ do
   results <- newSTRef ([] :: [([r],Int)])
   s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((toList a,curPos s):) >> pure s)) (emptyState l)
-  let f s | null (next s) = do
+  let go s = case pop (here s) of
+        Just (x, xs) -> x (s { here = xs }) >>= go
+        Nothing -> if null (next s)
+          then do
             sequenceA_ (reset s)
             rs <- readSTRef results
             pure (rs >>= (\(r,l) -> (,l) <$> r), Report {
@@ -232,23 +247,20 @@ run keep p l = runST $ do
               expected = names s,
               unconsumed = input s
             })
-          | otherwise = do
+          else do
             sequenceA_ (reset s)
             unless keep $ writeSTRef results []
-            go $ s {
+            -- traceM $ show $ curPos s
+            go $ State {
               next = [],
               input = tail $ input s,
               -- TODO: don't use a linked list for this, mb like std::vector, & do fifo
-              here = Queue [] $ reverse $ next s,
+              here = Queue (next s) [],
               curPos = curPos s + 1,
               names = [],
               reset = []
             }
-            where
-              go s = case pop (here s) of
-                Just (x, xs) -> x (s { here = xs }) >>= go
-                Nothing -> f s
-  f s1
+  go s1
 
 named :: Parser s e i a -> e -> Parser s e i a
 named (Parser p) e = Parser $ \cb s -> p cb (s{names = e:names s})
