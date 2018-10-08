@@ -60,9 +60,10 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 
 -- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults {
-  processed :: (S.Seq a),
-  unprocessed :: (S.Seq a),
-  callbacks :: [S.Seq a -> M s e i]
+  processed :: !(S.Seq a),
+  unprocessed :: !(S.Seq a),
+  callbacks :: [S.Seq a -> M s e i],
+  queued :: !Bool
 }
 
 -- TODO: no reason to use [a] here if we aren't merging results
@@ -74,6 +75,12 @@ instance Applicative (Results s e i) where
   pure x = Results (\cb -> cb $ pure x)
   Results f <*> Results x = Results (\cb -> f (\a -> x (\b -> cb (a <*> b))))
   liftA2 f (Results x) (Results y) = Results (\cb -> x (\a -> y (\b -> cb (liftA2 f a b))))
+  Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
+  -- {-# INLINE (*>) #-}
+  -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let r = b *> a in cb r)))
+  Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let !bl = S.length b in if bl == 1 then cb a else cb (a <* S.replicate bl ())))) --let !r = b *> a in cb r)))
+  -- {-# INLINE (<*) #-}
+
 
 -- FIXME: can merge results at same rule w/ diff start pos & same end pos!
 -- (if a calls b at pos i and j, and i-k & j-k both return results, only need to return once)
@@ -105,9 +112,12 @@ ruleP f = do
     resetcb = writeSTRef currentRef Nothing
     results !pos ref = Results $ \cb s -> do
       res <- readSTRef ref
-      -- RuleResults rs rcbs <- readSTRef ref
-      when (curPos s == pos) $ writeSTRef ref $ res { callbacks = cb:callbacks res }
-      if null $ processed res then pure s else cb (processed res) s
+      let !ps = processed res
+      if curPos s /= pos then cb ps s
+      else do
+        -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
+        writeSTRef ref $! res { callbacks = cb:callbacks res }
+        if null ps then pure s else cb ps s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -120,7 +130,7 @@ ruleP f = do
           let
             reset2 rs = do
               modifySTRef ({-# SCC "reset2_ref" #-} ref) (\(RuleI _ cbs) -> RuleI emptyResults cbs)
-              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs [] _) -> RuleResults xs [] undefined)
+              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs [] _ False) -> RuleResults xs [] undefined False)
               -- traceM $ "reset from: " <> (show $ curPos st)
               -- unsafeIOToST $ printStack "a"
               pure ()
@@ -129,20 +139,24 @@ ruleP f = do
               let xs = unprocessed rs
               if null xs then pure s else {-# SCC "propagate" #-} do
                 -- traceM "propagate"
-                writeSTRef ref $ rs { unprocessed = [], processed = xs <> processed rs }
+                writeSTRef ref $! rs { unprocessed = [], processed = xs <> processed rs, queued = False }
                 foldrM ($ xs) s $ callbacks rs
             g x s = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults [] x [])
+                  rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults [] x [] True)
                   writeSTRef ref ({-# SCC "g_ref" #-} RuleI rs' cbs)
                   -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
-                  foldrM ($ results (curPos s) rs') ({-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}) cbs
+                  let s' = {-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}
+                  foldrM ($ results (curPos s) rs') s' cbs
                 else do
                   res <- readSTRef rs
-                  writeSTRef rs $ {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res }
-                  pure $ {-# SCC "g_s" #-} s { here = {-# SCC "g_append" #-} push (recheck rs) (here s) }
+                  -- when (not $ queued res) $ do
+                  --   traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
+                  --   unsafeIOToST $ printStack 1
+                  writeSTRef rs $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
+                  pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push (recheck rs) (here s) }
           -- traceM $ show $ curPos st
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
@@ -181,6 +195,11 @@ instance Applicative (Parser s e i) where
   {-# INLINE pure #-}
   liftA2 f (Parser a) (Parser b) = Parser $ \cb -> a (\x -> b (\y -> cb (liftA2 f x y)))
   {-# INLINE liftA2 #-}
+  Parser a *> Parser b = Parser $ \cb -> a (\x -> b (\y -> cb (x *> y)))
+  {-# INLINE (*>) #-}
+  Parser a <* Parser b = Parser $ \cb -> a (\x -> b (\y -> cb (x <* y)))
+  {-# INLINE (<*) #-}
+
   -- this is old, currently we aren't merging results so this doesn't matter
   -- -- TODO: do we want this? currently w/ results it only returns once
   -- -- ((a <|> b) *> x) != (a *> x) <|> (b *> x)
