@@ -112,10 +112,10 @@ ruleP f = do
   emptyResults <- newSTRef (undefined :: RuleResults s e i a)
   let
     resetcb = writeSTRef currentRef Nothing
-    results !pos ref = Results $ \cb s -> do
+    results !pos !ref = Results $ \cb s -> do
       !res <- readSTRef ref
       if curPos s /= pos then cb (processed res) s
-      else do
+      else {-# SCC "results2" #-} do
         -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
         writeSTRef ref $! res { callbacks = cb:callbacks res }
         cb (processed res) s
@@ -130,13 +130,13 @@ ruleP f = do
           ref <- newSTRef (RuleI emptyResults [cb])
           writeSTRef currentRef (Just ref)
           let
-            reset2 rs = do
+            reset2 !rs = do
               modifySTRef ({-# SCC "reset2_ref" #-} ref) (\(RuleI _ cbs) -> RuleI emptyResults cbs)
               modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs [] _ False) -> RuleResults xs [] undefined False)
               -- traceM $ "reset from: " <> (show $ curPos st)
               -- unsafeIOToST $ printStack "a"
               pure ()
-            recheck ref s = do
+            recheck !ref s = do
               !rs <- readSTRef ref
               let xs = unprocessed rs
               -- if null xs then pure s else {-# SCC "propagate" #-} do
