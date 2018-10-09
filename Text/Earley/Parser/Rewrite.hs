@@ -11,6 +11,7 @@ import Control.Applicative
 import Control.Monad.Fix
 import Control.Arrow
 import Text.Earley.Grammar
+import Data.Coerce
 
 
 import qualified Data.Sequence as S
@@ -60,8 +61,8 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 
 -- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults {
-  processed :: !(S.Seq a),
-  unprocessed :: !(S.Seq a),
+  processed :: (S.Seq a),
+  unprocessed :: (S.Seq a),
   callbacks :: [S.Seq a -> M s e i],
   queued :: !Bool
 }
@@ -75,11 +76,11 @@ instance Applicative (Results s e i) where
   pure x = Results (\cb -> cb $ pure x)
   Results f <*> Results x = Results (\cb -> f (\a -> x (\b -> cb (a <*> b))))
   liftA2 f (Results x) (Results y) = Results (\cb -> x (\a -> y (\b -> cb (liftA2 f a b))))
-  Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
-  -- {-# INLINE (*>) #-}
-  -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let r = b *> a in cb r)))
-  Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let !bl = S.length b in if bl == 1 then cb a else cb (a <* S.replicate bl ())))) --let !r = b *> a in cb r)))
-  -- {-# INLINE (<*) #-}
+  -- Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
+  -- -- {-# INLINE (*>) #-}
+  -- -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let r = b *> a in cb r)))
+  -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> cb (a <* b))))-- let !bl = S.length b in if bl == 1 then cb a else cb (a <* S.replicate bl ())))) --let !r = b *> a in cb r)))
+  -- -- {-# INLINE (<*) #-}
 
 
 -- FIXME: can merge results at same rule w/ diff start pos & same end pos!
@@ -91,6 +92,7 @@ instance Applicative (Results s e i) where
 -- recover :: Parser s e i a -> ST s (Parser s e i a)
 -- recover p = do
 --   _
+
 
 data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
 
@@ -111,13 +113,13 @@ ruleP f = do
   let
     resetcb = writeSTRef currentRef Nothing
     results !pos ref = Results $ \cb s -> do
-      res <- readSTRef ref
-      let !ps = processed res
-      if curPos s /= pos then cb ps s
+      !res <- readSTRef ref
+      if curPos s /= pos then cb (processed res) s
       else do
         -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
         writeSTRef ref $! res { callbacks = cb:callbacks res }
-        if null ps then pure s else cb ps s
+        cb (processed res) s
+        -- if null ps then pure s else cb ps s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -135,26 +137,26 @@ ruleP f = do
               -- unsafeIOToST $ printStack "a"
               pure ()
             recheck ref s = do
-              rs <- readSTRef ref
+              !rs <- readSTRef ref
               let xs = unprocessed rs
-              if null xs then pure s else {-# SCC "propagate" #-} do
+              -- if null xs then pure s else {-# SCC "propagate" #-} do
                 -- traceM "propagate"
-                writeSTRef ref $! rs { unprocessed = [], processed = xs <> processed rs, queued = False }
-                foldrM ($ xs) s $ callbacks rs
+              writeSTRef ref $! rs { unprocessed = [], processed = xs <> processed rs, queued = False }
+              foldrM ($ xs) s $ callbacks rs
             g x s = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
                   rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults [] x [] True)
-                  writeSTRef ref ({-# SCC "g_ref" #-} RuleI rs' cbs)
+                  writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
                   -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
                   let s' = {-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}
                   foldrM ($ results (curPos s) rs') s' cbs
                 else do
-                  res <- readSTRef rs
+                  !res <- readSTRef rs
                   -- when (not $ queued res) $ do
                   --   traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
-                  --   unsafeIOToST $ printStack 1
+                  --   unsafeIOToST $ printStack res
                   writeSTRef rs $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
                   pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push (recheck rs) (here s) }
           -- traceM $ show $ curPos st
@@ -175,10 +177,12 @@ fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
 fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g [f $ toList l])))
 -- {-# INLINE fmapList #-}
 
-thin :: Parser s e i a -> Parser s e i ()
-thin = fmapList (\_ -> ())
+-- thin :: Parser s e i a -> Parser s e i ()
+-- thin = fmapList (\_ -> ())
 -- thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
+
+thin = id
 
 -- thin :: Parser s e i a -> Parser s e i ()
 -- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ [()]))
@@ -251,17 +255,17 @@ data Report e i = Report
                       -- which may be empty.
   } deriving (Eq, Ord, Read, Show)
 
-run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(r, Int)], Report e [a])
+run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(S.Seq r, Int)], Report e [a])
 run keep p l = runST $ do
-  results <- newSTRef ([] :: [([r],Int)])
-  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((toList a,curPos s):) >> pure s)) (emptyState l)
+  results <- newSTRef ([] :: [(S.Seq r,Int)])
+  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((a,curPos s):) >> pure s)) (emptyState l)
   let go s = case pop (here s) of
         Just (x, xs) -> x (s { here = xs }) >>= go
         Nothing -> if null (next s)
           then do
             sequenceA_ (reset s)
             rs <- readSTRef results
-            pure (rs >>= (\(r,l) -> (,l) <$> r), Report {
+            pure (rs, Report {
               position = curPos s,
               expected = names s,
               unconsumed = input s
@@ -315,10 +319,10 @@ parser :: (forall r. Grammar r (Prod r e t a)) -> Parser s e [t] a
 parser g = join $ liftST $ fmap interpProd $ interpGrammar g
 {-# INLINE parser #-}
 
-allParses :: (forall s. Parser s e [t] a) -> [t] -> ([(a,Int)],Report e [t])
+allParses :: (forall s. Parser s e [t] a) -> [t] -> ([(S.Seq a,Int)],Report e [t])
 allParses p i = run True p i
 
-fullParses :: (forall s. Parser s e [t] a) -> [t] -> ([a],Report e [t])
+fullParses :: (forall s. Parser s e [t] a) -> [t] -> ([S.Seq a],Report e [t])
 fullParses p i = first (fmap fst) $ run False p i
 
 -- | See e.g. how far the parser is able to parse the input string before it
