@@ -59,36 +59,45 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 -- problem is if left recursion + user getting list. so we can't give the user a complete [a]
 -- maybe could w/ nulls transformation though
 
--- TODO: diffeent SMany, (<>) has the wrong asymtotics for []
--- invariant: SMany nonempty
-data Seq a = Zero | One a | SMany [a]
+-- -- TODO: diffeent SMany, (<>) has the wrong asymtotics for []
+-- -- invariant: SMany nonempty
+-- data Seq a = Zero | One a | SMany [a]
 
-instance Functor Seq where
-  fmap f Zero = Zero
-  fmap f (One a) = One (f a)
-  fmap f (SMany a) = SMany (fmap f a)
-instance Applicative Seq where
-  pure = One
-  Zero <*> _ = Zero
-  _ <*> Zero = Zero
-  One f <*> One a = One (f a)
-  One f <*> SMany a = SMany (fmap f a)
-  SMany f <*> One a = SMany (fmap ($ a) f)
-  SMany f <*> SMany a = SMany (f <*> a)
-instance Semigroup (Seq a) where
-  Zero <> a = a
-  a <> Zero = a
-  One a <> SMany b = SMany (a:b)
-  SMany a <> One b = SMany (a ++ [b])
-  SMany a <> SMany b = SMany (a ++ b)
-instance Monoid (Seq a) where
-  mempty = Zero
-instance Foldable Seq where
-  null Zero = True
-  null _ = False
-  toList Zero = []
-  toList (One a) = [a]
-  toList (SMany a) = a
+-- instance Functor Seq where
+--   fmap f Zero = Zero
+--   fmap f (One a) = One (f a)
+--   fmap f (SMany a) = SMany (fmap f a)
+-- instance Applicative Seq where
+--   pure = One
+--   Zero <*> _ = Zero
+--   _ <*> Zero = Zero
+--   One f <*> One a = One (f a)
+--   One f <*> SMany a = SMany (fmap f a)
+--   SMany f <*> One a = SMany (fmap ($ a) f)
+--   SMany f <*> SMany a = SMany (f <*> a)
+
+--   _ <* Zero = Zero
+--   Zero <* _ = Zero
+--   a <* One _ = a
+--   a <* b = liftA2 const a b
+
+-- instance Semigroup (Seq a) where
+--   Zero <> a = a
+--   a <> Zero = a
+--   One a <> SMany b = SMany (a:b)
+--   SMany a <> One b = SMany (a ++ [b])
+--   SMany a <> SMany b = SMany (a ++ b)
+-- instance Monoid (Seq a) where
+--   mempty = Zero
+-- instance Foldable Seq where
+--   null Zero = True
+--   null _ = False
+--   toList Zero = []
+--   toList (One a) = [a]
+--   toList (SMany a) = a
+--   foldMap f Zero = mempty
+--   foldMap f (One a) = f a
+--   foldMap f (SMany a) = foldMap f a
 
 
 -- TODO: could we store a [Results s e i a] here?
@@ -111,7 +120,7 @@ instance Applicative (Results s e i) where
   -- Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
   -- -- {-# INLINE (*>) #-}
   -- -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let r = b *> a in cb r)))
-  -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> cb (a <* b))))-- let !bl = S.length b in if bl == 1 then cb a else cb (a <* S.replicate bl ())))) --let !r = b *> a in cb r)))
+  Results x <* Results y = Results (\cb -> x (\a -> y (\b -> cb (a <* b))))-- let !bl = S.length b in if bl == 1 then cb a else cb (a <* S.replicate bl ())))) --let !r = b *> a in cb r)))
   -- -- {-# INLINE (<*) #-}
 
 
@@ -164,7 +173,7 @@ ruleP f = do
           let
             reset2 !rs = do
               modifySTRef ({-# SCC "reset2_ref" #-} ref) (\(RuleI _ cbs) -> RuleI emptyResults cbs)
-              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs [] _ False) -> RuleResults xs [] undefined False)
+              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs [] _ False) -> RuleResults xs mempty undefined False)
               -- traceM $ "reset from: " <> (show $ curPos st)
               -- unsafeIOToST $ printStack "a"
               pure ()
@@ -173,13 +182,13 @@ ruleP f = do
               let xs = unprocessed rs
               -- if null xs then pure s else {-# SCC "propagate" #-} do
                 -- traceM "propagate"
-              writeSTRef ref $! rs { unprocessed = [], processed = xs <> processed rs, queued = False }
+              writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
               foldrM ($ xs) s $ callbacks rs
             g x s = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults [] x [] True)
+                  rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults mempty x [] True)
                   writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
                   -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
                   let s' = {-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}
@@ -206,7 +215,7 @@ bindList :: ([a] -> Parser s e i b) -> Parser s e i a -> Parser s e i b
 bindList f (Parser p) = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
 
 fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
-fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g [f $ toList l])))
+fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g $ pure $ f $ toList l)))
 -- {-# INLINE fmapList #-}
 
 -- thin :: Parser s e i a -> Parser s e i ()
