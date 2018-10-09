@@ -59,6 +59,38 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 -- problem is if left recursion + user getting list. so we can't give the user a complete [a]
 -- maybe could w/ nulls transformation though
 
+-- TODO: diffeent SMany, (<>) has the wrong asymtotics for []
+-- invariant: SMany nonempty
+data Seq a = Zero | One a | SMany [a]
+
+instance Functor Seq where
+  fmap f Zero = Zero
+  fmap f (One a) = One (f a)
+  fmap f (SMany a) = SMany (fmap f a)
+instance Applicative Seq where
+  pure = One
+  Zero <*> _ = Zero
+  _ <*> Zero = Zero
+  One f <*> One a = One (f a)
+  One f <*> SMany a = SMany (fmap f a)
+  SMany f <*> One a = SMany (fmap ($ a) f)
+  SMany f <*> SMany a = SMany (f <*> a)
+instance Semigroup (Seq a) where
+  Zero <> a = a
+  a <> Zero = a
+  One a <> SMany b = SMany (a:b)
+  SMany a <> One b = SMany (a ++ [b])
+  SMany a <> SMany b = SMany (a ++ b)
+instance Monoid (Seq a) where
+  mempty = Zero
+instance Foldable Seq where
+  null Zero = True
+  null _ = False
+  toList Zero = []
+  toList (One a) = [a]
+  toList (SMany a) = a
+
+
 -- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults {
   processed :: (S.Seq a),
@@ -124,7 +156,7 @@ ruleP f = do
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
           RuleI r cbs <- readSTRef ref
-          writeSTRef ref (RuleI r (cb:cbs))
+          writeSTRef ref $ RuleI r (cb:cbs)
           if r == emptyResults then pure st else cb (results (curPos st) r) st
         Nothing -> do
           ref <- newSTRef (RuleI emptyResults [cb])
