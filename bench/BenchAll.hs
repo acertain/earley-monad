@@ -77,11 +77,11 @@ expr' = mdo
   add <- fmap (foldl1 Add) <$> var `sepBy1` token "+"
   return mul
 
-parseEarley :: [Token] -> Maybe Expr
-parseEarley input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr) input))
+-- parseEarley :: [Token] -> Maybe Expr
+-- parseEarley input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr) input))
 
-parseEarley' :: [Token] -> Maybe Expr
-parseEarley' input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr') input))
+-- parseEarley' :: [Token] -> Maybe Expr
+-- parseEarley' input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr') input))
 
 -- Parsec parsec
 
@@ -110,11 +110,11 @@ treeInput size = (show size, tokenExpr 0 $ treeSum size)
 inputBench :: (String, [Token]) -> Benchmark
 inputBench (name, input) = bench name $ nf id input
 
-earleyBench :: (String, [Token]) -> Benchmark
-earleyBench (name, input) = bench name $ nf parseEarley input
+-- earleyBench :: (String, [Token]) -> Benchmark
+-- earleyBench (name, input) = bench name $ nf parseEarley input
 
-earley'Bench :: (String, [Token]) -> Benchmark
-earley'Bench (name, input) = bench name $ nf parseEarley' input
+-- earley'Bench :: (String, [Token]) -> Benchmark
+-- earley'Bench (name, input) = bench name $ nf parseEarley' input
 
 parsecBench :: (String, [Token]) -> Benchmark
 parsecBench (name, input) = bench name $ nf parseParsec input
@@ -137,16 +137,16 @@ veryAmbiguous = mdo
            <?> 's'
   return s
 
-ambigTest n = bench (show n) $ nf (\i -> listToMaybe $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) i) (replicate n 'b')
+ambigTest n = bench (show n) $ nf (\i -> length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) i) (replicate n 'b')
 
 main :: IO ()
 main = do 
   -- -- evaluate (rnf linearInputs)
   -- -- evaluate (rnf treeInputs)
-  print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 45 'b')
+  print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 50 'b')
   -- -- pure ()
   -- -- pure ()
-  -- defaultMain $ fmap ambigTest [11..45]
+  -- defaultMain $ fmap ambigTest [10,20..200]
 
   -- defaultMain
   --   [ -- bgroup "inputs" $ map inputBench linearInputs 

@@ -59,60 +59,65 @@ pop (Queue x (y:ys)) = Just (y, Queue x ys)
 -- problem is if left recursion + user getting list. so we can't give the user a complete [a]
 -- maybe could w/ nulls transformation though
 
--- -- TODO: diffeent SMany, (<>) has the wrong asymtotics for []
--- -- invariant: SMany nonempty
--- data Seq a = Zero | One a | SMany [a]
+-- TODO: diffeent SMany, (<>) has the wrong asymtotics for []
+-- invariant: SMany nonempty
+data Seq a = Zero | One a | SMany [a]
 
--- instance Functor Seq where
---   fmap f Zero = Zero
---   fmap f (One a) = One (f a)
---   fmap f (SMany a) = SMany (fmap f a)
--- instance Applicative Seq where
---   pure = One
---   Zero <*> _ = Zero
---   _ <*> Zero = Zero
---   One f <*> One a = One (f a)
---   One f <*> SMany a = SMany (fmap f a)
---   SMany f <*> One a = SMany (fmap ($ a) f)
---   SMany f <*> SMany a = SMany (f <*> a)
+instance Functor Seq where
+  fmap f Zero = Zero
+  fmap f (One a) = One (f a)
+  fmap f (SMany a) = SMany (fmap f a)
+instance Applicative Seq where
+  pure = One
+  Zero <*> _ = Zero
+  _ <*> Zero = Zero
+  One f <*> One a = One (f a)
+  One f <*> SMany a = SMany (fmap f a)
+  SMany f <*> One a = SMany (fmap ($ a) f)
+  SMany f <*> SMany a = SMany (f <*> a)
 
---   _ <* Zero = Zero
---   Zero <* _ = Zero
---   a <* One _ = a
---   a <* b = liftA2 const a b
+  _ <* Zero = Zero
+  Zero <* _ = Zero
+  a <* One _ = a
+  One a <* SMany b = SMany ([a] <* b)
+    -- where go [] = []
+    --       go (x:xs) = a:go xs
+  SMany a <* SMany b = SMany (a <* b)
+  -- a <* b = liftA2 const a b
 
--- instance Semigroup (Seq a) where
---   Zero <> a = a
---   a <> Zero = a
---   One a <> SMany b = SMany (a:b)
---   SMany a <> One b = SMany (a ++ [b])
---   SMany a <> SMany b = SMany (a ++ b)
--- instance Monoid (Seq a) where
---   mempty = Zero
--- instance Foldable Seq where
---   null Zero = True
---   null _ = False
---   toList Zero = []
---   toList (One a) = [a]
---   toList (SMany a) = a
---   foldMap f Zero = mempty
---   foldMap f (One a) = f a
---   foldMap f (SMany a) = foldMap f a
+
+instance Semigroup (Seq a) where
+  Zero <> a = a
+  a <> Zero = a
+  One a <> One b = SMany [a,b]
+  One a <> SMany b = SMany (a:b)
+  SMany a <> One b = SMany (a ++ [b])
+  SMany a <> SMany b = SMany (a ++ b)
+instance Monoid (Seq a) where
+  mempty = Zero
+instance Foldable Seq where
+  null Zero = True
+  null _ = False
+  toList Zero = []
+  toList (One a) = [a]
+  toList (SMany a) = a
+  foldMap f Zero = mempty
+  foldMap f (One a) = f a
+  foldMap f (SMany a) = foldMap f a
 
 
 -- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults {
-  processed :: (S.Seq a),
-  unprocessed :: (S.Seq a),
-  callbacks :: [S.Seq a -> M s e i],
+  processed :: !(Seq a),
+  unprocessed :: !(Seq a),
+  callbacks :: [Seq a -> M s e i],
   queued :: !Bool
 }
 
--- TODO: no reason to use [a] here if we aren't merging results
-newtype Results s e i a = Results ((S.Seq a -> M s e i) -> M s e i)
+newtype Results s e i a = Results ((Seq a -> M s e i) -> M s e i)
 
 instance Functor (Results s e i) where
-  fmap f (Results g) = Results (\cb -> g (cb . fmap f))
+  fmap f (Results g) = Results (\cb -> g (\x -> let !r = fmap f x in cb r))
 instance Applicative (Results s e i) where
   pure x = Results (\cb -> cb $ pure x)
   Results f <*> Results x = Results (\cb -> f (\a -> x (\b -> cb (a <*> b))))
@@ -120,7 +125,7 @@ instance Applicative (Results s e i) where
   -- Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
   -- -- {-# INLINE (*>) #-}
   -- -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let r = b *> a in cb r)))
-  Results x <* Results y = Results (\cb -> x (\a -> y (\b -> cb (a <* b))))-- let !bl = S.length b in if bl == 1 then cb a else cb (a <* S.replicate bl ())))) --let !r = b *> a in cb r)))
+  Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let !r = a <* b in cb r)))
   -- -- {-# INLINE (<*) #-}
 
 
@@ -142,8 +147,11 @@ printStack a = do
   stack <- ccsToStrings =<< getCurrentCCS a
   putStrLn $ renderStack stack
 
+-- what if keeping callabcks around is what's causing the leak?
+-- 
+
 -- NOTE: techincally this is two things in one (GLL (and us) merge them):
--- 1. merge multiple `Result`s at same position (optimization, needed to be `O(n^3)`, speeds up `rule (\_ -> a <|> b) <*> c`)
+-- 1. merge multiple `Result`s at same position (optimization, needed to be `O(n^3)`, speeds up `rule (\_ -> (a <|> b) <*> c`)
 -- 2. cps processing for start position, to deal with left recursion
 ruleP :: (Parser s e i a -> Parser s e i a) -> ST s (Parser s e i a)
 ruleP f = do
@@ -159,8 +167,9 @@ ruleP f = do
       else {-# SCC "results2" #-} do
         -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
         writeSTRef ref $! res { callbacks = cb:callbacks res }
-        cb (processed res) s
-        -- if null ps then pure s else cb ps s
+        if null (processed res) then pure s else do
+          -- when (queued res) $ traceM "hi :|"
+          cb (processed res) s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
@@ -173,17 +182,17 @@ ruleP f = do
           let
             reset2 !rs = do
               modifySTRef ({-# SCC "reset2_ref" #-} ref) (\(RuleI _ cbs) -> RuleI emptyResults cbs)
-              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs [] _ False) -> RuleResults xs mempty undefined False)
+              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs Zero _ False) -> RuleResults xs mempty undefined False)
               -- traceM $ "reset from: " <> (show $ curPos st)
               -- unsafeIOToST $ printStack "a"
               pure ()
             recheck !ref s = do
               !rs <- readSTRef ref
               let xs = unprocessed rs
-              -- if null xs then pure s else {-# SCC "propagate" #-} do
+              if null xs then pure s else {-# SCC "propagate" #-} do
                 -- traceM "propagate"
-              writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
-              foldrM ($ xs) s $ callbacks rs
+                writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
+                foldrM ($ xs) s $ callbacks rs
             g x s = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
@@ -196,8 +205,8 @@ ruleP f = do
                 else do
                   !res <- readSTRef rs
                   -- when (not $ queued res) $ do
-                  --   traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
-                  --   unsafeIOToST $ printStack res
+                  traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
+                  unsafeIOToST $ printStack res
                   writeSTRef rs $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
                   pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push (recheck rs) (here s) }
           -- traceM $ show $ curPos st
@@ -296,9 +305,9 @@ data Report e i = Report
                       -- which may be empty.
   } deriving (Eq, Ord, Read, Show)
 
-run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(S.Seq r, Int)], Report e [a])
+run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(Seq r, Int)], Report e [a])
 run keep p l = runST $ do
-  results <- newSTRef ([] :: [(S.Seq r,Int)])
+  results <- newSTRef ([] :: [(Seq r,Int)])
   s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((a,curPos s):) >> pure s)) (emptyState l)
   let go s = case pop (here s) of
         Just (x, xs) -> x (s { here = xs }) >>= go
@@ -360,10 +369,10 @@ parser :: (forall r. Grammar r (Prod r e t a)) -> Parser s e [t] a
 parser g = join $ liftST $ fmap interpProd $ interpGrammar g
 {-# INLINE parser #-}
 
-allParses :: (forall s. Parser s e [t] a) -> [t] -> ([(S.Seq a,Int)],Report e [t])
+allParses :: (forall s. Parser s e [t] a) -> [t] -> ([(Seq a,Int)],Report e [t])
 allParses p i = run True p i
 
-fullParses :: (forall s. Parser s e [t] a) -> [t] -> ([S.Seq a],Report e [t])
+fullParses :: (forall s. Parser s e [t] a) -> [t] -> ([Seq a],Report e [t])
 fullParses p i = first (fmap fst) $ run False p i
 
 -- | See e.g. how far the parser is able to parse the input string before it
