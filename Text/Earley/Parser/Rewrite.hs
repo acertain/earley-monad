@@ -51,7 +51,7 @@ push a (Queue x y) = Queue (a:x) y
 
 pop :: Queue a -> Maybe (a, Queue a)
 pop (Queue [] []) = Nothing
-pop (Queue x []) = pop $ Queue [] (reverse x)
+pop (Queue x []) = pop $ trace "swap" $ Queue [] (reverse x)
 pop (Queue x (y:ys)) = Just (y, Queue x ys)
 
 -- could we s/[a]/a/ on Results? idk if it affects time complexity, but the user really should be able to get an [a]
@@ -119,7 +119,7 @@ newtype Results s e i a = Results ((Seq a -> M s e i) -> M s e i)
 instance Functor (Results s e i) where
   fmap f (Results g) = Results (\cb -> g (\x -> let !r = fmap f x in cb r))
 instance Applicative (Results s e i) where
-  pure x = Results (\cb -> cb $ pure x)
+  pure x = Results (\cb -> cb $! pure x)
   Results f <*> Results x = Results (\cb -> f (\a -> x (\b -> cb (a <*> b))))
   liftA2 f (Results x) (Results y) = Results (\cb -> x (\a -> y (\b -> cb (liftA2 f a b))))
   -- Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
@@ -163,12 +163,16 @@ ruleP f = do
     resetcb = writeSTRef currentRef Nothing
     results !pos !ref = Results $ \cb s -> do
       !res <- readSTRef ref
-      if curPos s /= pos then cb (processed res) s
+      if curPos s /= pos then do
+        -- traceM $ "unaligned results: " <> show pos <> " from " <> show (curPos s)
+        -- unsafeIOToST $ printStack f
+        cb (processed res) s
       else {-# SCC "results2" #-} do
         -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
         writeSTRef ref $! res { callbacks = cb:callbacks res }
         if null (processed res) then pure s else do
           -- when (queued res) $ traceM "hi :|"
+          -- traceM $ show $ length $ callbacks res
           cb (processed res) s
     p = Parser $ \cb st ->
       readSTRef currentRef >>= \r -> case r of
@@ -182,6 +186,7 @@ ruleP f = do
           let
             reset2 !rs = do
               modifySTRef ({-# SCC "reset2_ref" #-} ref) (\(RuleI _ cbs) -> RuleI emptyResults cbs)
+              -- TODO: when can we gc processed here?
               modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs Zero _ False) -> RuleResults xs mempty undefined False)
               -- traceM $ "reset from: " <> (show $ curPos st)
               -- unsafeIOToST $ printStack "a"
@@ -190,9 +195,11 @@ ruleP f = do
               !rs <- readSTRef ref
               let xs = unprocessed rs
               if null xs then pure s else {-# SCC "propagate" #-} do
-                -- traceM "propagate"
                 writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
-                foldrM ($ xs) s $ callbacks rs
+                -- traceM $ show $ curPos s
+                -- unsafeIOToST $ printStack f
+                -- traceM $ show $ length $ names s
+                foldMA xs (callbacks rs) s
             g x s = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
@@ -201,17 +208,23 @@ ruleP f = do
                   writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
                   -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
                   let s' = {-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}
-                  foldrM ($ results (curPos s) rs') s' cbs
+                  foldMA (results (curPos s) rs') cbs s'
                 else do
                   !res <- readSTRef rs
-                  -- when (not $ queued res) $ do
-                  traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
-                  unsafeIOToST $ printStack res
+                  when (not $ queued res) $ do
+                    traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
+                    -- unsafeIOToST $ printStack res
                   writeSTRef rs $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
                   pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push (recheck rs) (here s) }
           -- traceM $ show $ curPos st
+          -- unsafeIOToST $ printStack f
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
   pure p
+  where
+  foldMA :: a -> [a -> b -> ST s b] -> b -> ST s b
+  foldMA y (x:xs) s = x y s >>= foldMA y xs
+  foldMA y [] s = pure s
+
 
 
 -- fixP :: (Parser s e i a -> Parser s e i a) -> Parser s e i a
@@ -235,7 +248,7 @@ fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> 
 thin = id
 
 -- thin :: Parser s e i a -> Parser s e i ()
--- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ [()]))
+-- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ pure $ ()))
 
 instance Functor (Parser s e i) where
   fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f <$> x))
@@ -305,8 +318,8 @@ data Report e i = Report
                       -- which may be empty.
   } deriving (Eq, Ord, Read, Show)
 
-run :: Bool -> (forall s. Parser s e [a] r) -> [a] -> ([(Seq r, Int)], Report e [a])
-run keep p l = runST $ do
+run :: Bool -> Parser s e [a] r -> [a] -> ST s ([(Seq r, Int)], Report e [a])
+run keep p l = do
   results <- newSTRef ([] :: [(Seq r,Int)])
   s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((a,curPos s):) >> pure s)) (emptyState l)
   let go s = case pop (here s) of
@@ -369,17 +382,23 @@ parser :: (forall r. Grammar r (Prod r e t a)) -> Parser s e [t] a
 parser g = join $ liftST $ fmap interpProd $ interpGrammar g
 {-# INLINE parser #-}
 
-allParses :: (forall s. Parser s e [t] a) -> [t] -> ([(Seq a,Int)],Report e [t])
-allParses p i = run True p i
+allParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([(Seq a,Int)],Report e [t])
+allParses p i = runST $ do
+  p' <- p
+  run True p' i
 
-fullParses :: (forall s. Parser s e [t] a) -> [t] -> ([Seq a],Report e [t])
-fullParses p i = first (fmap fst) $ run False p i
+fullParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([Seq a],Report e [t])
+fullParses p i = runST $ do
+  p' <- p
+  first (fmap fst) <$> run False p' i
 
 -- | See e.g. how far the parser is able to parse the input string before it
 -- fails.  This can be much faster than getting the parse results for highly
 -- ambiguous grammars.
-report :: (forall s. Parser s e [t] a) -> [t] -> Report e [t]
-report p i = snd $ run False p i
+report :: (forall s. ST s (Parser s e [t] a)) -> [t] -> Report e [t]
+report p i = runST $ do
+  p' <- p
+  snd <$> run False p' i
 
 -- ident (x:_) = isAlpha x
 -- ident _     = False
