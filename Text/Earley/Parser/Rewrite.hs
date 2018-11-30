@@ -1,4 +1,4 @@
-{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
@@ -148,7 +148,7 @@ data RuleResults s e i a = RuleResults {
   unprocessed :: !(Seq a),
   callbacks :: [Seq a -> M s e i],
   queued :: !Bool
-}
+} | DelayedResults [(Seq a -> M s e i) -> M s e i]
 
 printStack :: HasCallStack => a -> IO ()
 printStack a = do
@@ -161,7 +161,7 @@ printStack a = do
 -- NOTE: techincally this is two things in one (GLL (and us) merge them):
 -- 1. merge multiple `Result`s at same position (optimization, needed to be `O(n^3)`, speeds up `rule (\_ -> (a <|> b) <*> c`)
 -- 2. cps processing for start position, to deal with left recursion
-ruleP :: (Parser s e i a -> Parser s e i a) -> ST s (Parser s e i a)
+ruleP :: forall s e i a. (Parser s e i a -> Parser s e i a) -> ST s (Parser s e i a)
 ruleP f = do
   -- TODO: remove the Maybe, just use an empty RuleI
   currentRef <- newSTRef (Nothing :: Maybe (STRef s (RuleI s e i a)))
@@ -169,19 +169,55 @@ ruleP f = do
   emptyResults <- newSTRef (undefined :: RuleResults s e i a)
   let
     resetcb = writeSTRef currentRef Nothing
-    results !pos !ref = Results $ \cb s -> do
+    resetr !rs =
+      -- TODO: when can we gc processed here?
+      modifySTRef ({-# SCC "reset2_rs" #-} rs) $ \case
+        (RuleResults xs Zero _ False) -> RuleResults xs mempty undefined False
+        DelayedResults rxs -> DelayedResults rxs
+    results !birthPos !pos !ref = Results $ \cb s -> do
       !res <- readSTRef ref
-      if curPos s /= pos then
-        -- traceM $ "unaligned results: " <> show pos <> " from " <> show (curPos s)
-        -- unsafeIOToST $ printStack f
-        cb (processed res) s
-      else {-# SCC "results2" #-} do
-        -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
-        writeSTRef ref $! res { callbacks = cb:callbacks res }
-        if null (processed res) then pure s else
-          -- when (queued res) $ traceM "hi :|"
-          -- traceM $ show $ length $ callbacks res
-          cb (processed res) s
+      case res of
+        DelayedResults rxs -> do
+          -- undefined
+          writeSTRef ref $ RuleResults {
+            processed = mempty,
+            unprocessed = mempty,
+            callbacks = [cb],
+            queued = False
+          }
+          foldMA (h birthPos ref) rxs $ s { reset = resetr ref:reset s }
+        RuleResults{} ->
+          -- TODO: is this right anymore?
+          if curPos s /= pos then
+            -- traceM $ "unaligned results: " <> show pos <> " from " <> show (curPos s)
+            -- unsafeIOToST $ printStack f
+            cb (processed res) s
+          else {-# SCC "results2" #-} do
+            -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
+            writeSTRef ref $! res { callbacks = cb:callbacks res }
+            if null (processed res) then pure s else
+              -- when (queued res) $ traceM "hi :|"
+              -- traceM $ show $ length $ callbacks res
+              cb (processed res) s
+    recheck !ref s = do
+      !rs <- readSTRef ref
+      case rs of
+        DelayedResults rxs -> undefined
+        RuleResults{} -> do
+          let xs = unprocessed rs
+          if null xs then pure s else {-# SCC "propagate" #-} do
+            writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
+            -- traceM $ show $ curPos s
+            -- unsafeIOToST $ printStack f
+            -- traceM $ "propagate " <> (show $ length $ callbacks rs) <> " from " <> (show $ birthPos) <> " at " <> (show $ curPos s)
+            foldMA xs (callbacks rs) s
+    h !birthPos !ref x s = do
+      !res <- readSTRef ref
+      -- when (not $ queued res) $
+          --   traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show birthPos)
+          --   -- unsafeIOToST $ printStack res
+      writeSTRef ref $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
+      pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push birthPos (recheck ref) (here s) }
     p = Parser $ \cb st -> do
       let !birthPos = curPos st
       readSTRef currentRef >>= \r -> case r of
@@ -189,50 +225,37 @@ ruleP f = do
           RuleI r cbs <- readSTRef ref
           -- traceM $ "new child " <> (show $ length cbs) <> " at " <> (show birthPos)
           writeSTRef ref $ RuleI r (cb:cbs)
-          if r == emptyResults then pure st else cb (results birthPos r) st
+          if r == emptyResults then pure st else cb (results birthPos birthPos r) st
         Nothing -> do
           ref <- newSTRef (RuleI emptyResults [cb])
           writeSTRef currentRef (Just ref)
           let
-            reset2 !rs = do
+            reset2 =
               modifySTRef ({-# SCC "reset2_ref" #-} ref) (\(RuleI _ cbs) -> RuleI emptyResults cbs)
-              -- TODO: when can we gc processed here?
-              modifySTRef ({-# SCC "reset2_rs" #-} rs) (\(RuleResults xs Zero _ False) -> RuleResults xs mempty undefined False)
-              -- traceM $ "reset from: " <> (show $ curPos st)
-              -- unsafeIOToST $ printStack "a"
-              pure ()
-            recheck !ref s = do
-              !rs <- readSTRef ref
-              let xs = unprocessed rs
-              if null xs then pure s else {-# SCC "propagate" #-} do
-                writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
-                -- traceM $ show $ curPos s
-                -- unsafeIOToST $ printStack f
-                -- traceM $ "propagate " <> (show $ length $ callbacks rs) <> " from " <> (show $ birthPos) <> " at " <> (show $ curPos s)
-                foldMA xs (callbacks rs) s
-            g x s = do
+            g (Results rxs) s = do
               RuleI rs cbs <- readSTRef ref
               if rs == emptyResults
                 then do
-                  rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults mempty x [] True)
+                  rs' <- {-# SCC "g_rs'" #-} newSTRef $ DelayedResults [rxs]
                   writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
                   -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show birthPos)
-                  let s' = {-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push birthPos (recheck rs') (here s) } -- push (recheck rs') (here s)}
-                  -- TODO: move this to recheck?
-                  foldMA (results (curPos s) rs') cbs s'
+                  let s' = {-# SCC "g_s1" #-} s {reset = reset2:reset s} -- , here = push birthPos (recheck rs') (here s) } -- push (recheck rs') (here s)}
+                  -- TODO: move this to another different recheck?
+                  foldMA (results birthPos (curPos s) rs') cbs s'
                 else do
                   !res <- readSTRef rs
-                  when (not $ queued res) $
-                    traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show birthPos)
-                    -- unsafeIOToST $ printStack res
-                  writeSTRef rs $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
-                  pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push birthPos (recheck rs) (here s) }
+                  case res of
+                    DelayedResults rxs' -> do
+                      writeSTRef rs (DelayedResults (rxs:rxs'))
+                      pure s
+                    RuleResults{} ->
+                      rxs (h birthPos rs) s
           -- traceM $ show $ curPos st
           -- unsafeIOToST $ printStack f
-          unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
+          unParser (f p) g (st {reset = resetcb:reset st})
   pure p
   where
-  foldMA :: a -> [a -> b -> ST s b] -> b -> ST s b
+  foldMA :: forall s a b. a -> [a -> b -> ST s b] -> b -> ST s b
   foldMA y (x:xs) s = x y s >>= foldMA y xs
   foldMA _ [] s = pure s
 
@@ -334,8 +357,8 @@ data Report e i = Report
 
 run :: Bool -> Parser s e [a] r -> [a] -> ST s ([(Seq r, Int)], Report e [a])
 run keep p l = do
-  results <- newSTRef ([] :: [(Seq r,Int)])
-  s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((a,curPos s):) >> pure s)) (emptyState l)
+  results <- newSTRef ([] :: [(Results s e i r,Int)])
+  s1 <- unParser p (\rs s -> modifySTRef results ((rs,curPos s):) >> pure s) (emptyState l)
   let go s = case M.maxView (here s) of
         Just (l,hr) -> go' (reverse l) (s { here = hr }) where
           go' [] s = go s
@@ -343,7 +366,9 @@ run keep p l = do
         Nothing -> if null (next s)
           then do
             sequenceA_ (reset s)
-            rs <- readSTRef results
+            results' <- newSTRef ([] :: [(Seq r, Int)])
+            -- _
+            rs <- readSTRef results'
             pure (rs, Report {
               position = curPos s,
               expected = names s,
