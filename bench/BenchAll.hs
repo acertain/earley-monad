@@ -130,8 +130,8 @@ treeInputs = map treeInput benchSizes
 
 veryAmbiguous :: ST r (Parser r Char String ())
 veryAmbiguous = mdo
-  t <- rule $ thin $ () <$ s <* s
-  s <- rule $ thin $
+  t <- rule $ {-# SCC "rule_t" #-} thin $ () <$ s <* s
+  s <- rule $ {-# SCC "rule_s" #-} thin $
         () <$ token 'b'
            <|> t
            <|> s <* t

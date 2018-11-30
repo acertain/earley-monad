@@ -112,13 +112,6 @@ instance Foldable Seq where
   foldMap f (SMany a) = foldMap f a
 
 
--- TODO: could we store a [Results s e i a] here?
-data RuleResults s e i a = RuleResults {
-  processed :: !(Seq a),
-  unprocessed :: !(Seq a),
-  callbacks :: [Seq a -> M s e i],
-  queued :: !Bool
-}
 
 newtype Results s e i a = Results ((Seq a -> M s e i) -> M s e i)
 
@@ -147,6 +140,15 @@ instance Applicative (Results s e i) where
 
 
 data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
+
+
+-- TODO: could we store a [Results s e i a] here?
+data RuleResults s e i a = RuleResults {
+  processed :: !(Seq a),
+  unprocessed :: !(Seq a),
+  callbacks :: [Seq a -> M s e i],
+  queued :: !Bool
+}
 
 printStack :: HasCallStack => a -> IO ()
 printStack a = do
