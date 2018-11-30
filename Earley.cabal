@@ -39,7 +39,7 @@ library
                        Text.Earley.Parser,
                        Text.Earley.Parser.Internal,
                        Text.Earley.Parser.Rewrite
-  build-depends:       base >=4.6 && <5, ListLike >=4.1, containers
+  build-depends:       base >=4.6 && <5, ListLike >=4.1, containers, criterion
   if impl(ghc < 8.0)
     build-depends:     semigroups >=0.18
   default-language:    Haskell2010
@@ -122,7 +122,7 @@ benchmark bench
   type:                exitcode-stdio-1.0
   hs-source-dirs:      . bench
   main-is:             BenchAll.hs
-  build-depends:       base, Earley, ListLike, deepseq, criterion >=1.1, parsec >=3.1
+  build-depends:       base, Earley, ListLike, deepseq, criterion >=1.1, parsec >=3.1, containers
   if impl(ghc < 8.0)
     build-depends:     semigroups >=0.18
   default-language:    Haskell2010

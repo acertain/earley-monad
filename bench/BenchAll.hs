@@ -130,20 +130,22 @@ treeInputs = map treeInput benchSizes
 
 veryAmbiguous :: ST r (Parser r Char String ())
 veryAmbiguous = mdo
+  t <- rule $ thin $ () <$ s <* s
   s <- rule $ thin $
-               () <$ token 'b'
-           <|> () <$ s <* s
-           <|> () <$ s <* s <* s
+        () <$ token 'b'
+           <|> t
+           <|> s <* t
            <?> 's'
   return s
 
-ambigTest n = bench (show n) $ nf (\i -> length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) i) (replicate n 'b')
+ambigTest n = bench (show n) $ nf (\i -> length $ fst $ fullParses veryAmbiguous i) (replicate n 'b')
 
 main :: IO ()
 main = do 
   -- -- evaluate (rnf linearInputs)
   -- -- evaluate (rnf treeInputs)
-  print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 50 'b')
+  print $ length $ fst $ fullParses veryAmbiguous (replicate 200 'b')
+  -- print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 200 'b')
   -- -- pure ()
   -- -- pure ()
   -- defaultMain $ fmap ambigTest [10,20..200]

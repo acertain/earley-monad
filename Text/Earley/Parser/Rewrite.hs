@@ -12,7 +12,8 @@ import Control.Monad.Fix
 import Control.Arrow
 import Text.Earley.Grammar
 import Data.Coerce
-
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as M
 
 import qualified Data.Sequence as S
 import GHC.Stack
@@ -26,7 +27,9 @@ data State s e i = State {
   reset :: ![ST s ()],
   next :: ![M s e i],
   -- actions to process once we're done at current position but before next position
-  here :: !(Queue (M s e i)),
+  -- used only for rules, keyed by birthpos of the rule
+  -- so we can get better complexity
+  here :: IntMap [M s e i], -- [(Int,Queue M s e i)] -- !(Queue (M s e i)),
   curPos :: {-# UNPACK #-} !Int,
   input :: i,
   names :: [e]
@@ -44,22 +47,25 @@ liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 {-# INLINE liftST #-}
 
 
-data Queue a = Queue ![a] ![a]
+-- data Queue a = Queue ![a] ![a]
 
-push :: a -> Queue a -> Queue a
-push a (Queue x y) = Queue (a:x) y
+-- push :: a -> Queue a -> Queue a
+-- push a (Queue x y) = Queue (a:x) y
 
-pop :: Queue a -> Maybe (a, Queue a)
-pop (Queue [] []) = Nothing
-pop (Queue x []) = pop $ trace "swap" $ Queue [] (reverse x)
-pop (Queue x (y:ys)) = Just (y, Queue x ys)
+-- pop :: Queue a -> Maybe (a, Queue a)
+-- pop (Queue [] []) = Nothing
+-- pop (Queue x []) = pop $ trace ``"swap" $ Queue [] (reverse x)
+-- pop (Queue x (y:ys)) = Just (y, Queue x ys)
+
+push :: Int -> a -> IntMap [a] -> IntMap [a]
+push i a = M.alter (Just . maybe [a] (a:)) i
 
 -- could we s/[a]/a/ on Results? idk if it affects time complexity, but the user really should be able to get an [a]
 -- maybe we can use some lazy IO trick to give the user a complete [a]? 
 -- problem is if left recursion + user getting list. so we can't give the user a complete [a]
 -- maybe could w/ nulls transformation though
 
--- TODO: diffeent SMany, (<>) has the wrong asymtotics for []
+-- TODO: different SMany, (<>) has the wrong asymtotics for []
 -- invariant: SMany nonempty
 data Seq a = Zero | One a | SMany [a]
 
@@ -163,23 +169,25 @@ ruleP f = do
     resetcb = writeSTRef currentRef Nothing
     results !pos !ref = Results $ \cb s -> do
       !res <- readSTRef ref
-      if curPos s /= pos then do
+      if curPos s /= pos then
         -- traceM $ "unaligned results: " <> show pos <> " from " <> show (curPos s)
         -- unsafeIOToST $ printStack f
         cb (processed res) s
       else {-# SCC "results2" #-} do
         -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
         writeSTRef ref $! res { callbacks = cb:callbacks res }
-        if null (processed res) then pure s else do
+        if null (processed res) then pure s else
           -- when (queued res) $ traceM "hi :|"
           -- traceM $ show $ length $ callbacks res
           cb (processed res) s
-    p = Parser $ \cb st ->
+    p = Parser $ \cb st -> do
+      let !birthPos = curPos st
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
           RuleI r cbs <- readSTRef ref
+          -- traceM $ "new child " <> (show $ length cbs) <> " at " <> (show birthPos)
           writeSTRef ref $ RuleI r (cb:cbs)
-          if r == emptyResults then pure st else cb (results (curPos st) r) st
+          if r == emptyResults then pure st else cb (results birthPos r) st
         Nothing -> do
           ref <- newSTRef (RuleI emptyResults [cb])
           writeSTRef currentRef (Just ref)
@@ -198,7 +206,7 @@ ruleP f = do
                 writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
                 -- traceM $ show $ curPos s
                 -- unsafeIOToST $ printStack f
-                -- traceM $ show $ length $ names s
+                -- traceM $ "propagate " <> (show $ length $ callbacks rs) <> " from " <> (show $ birthPos) <> " at " <> (show $ curPos s)
                 foldMA xs (callbacks rs) s
             g x s = do
               RuleI rs cbs <- readSTRef ref
@@ -206,16 +214,17 @@ ruleP f = do
                 then do
                   rs' <- {-# SCC "g_rs'" #-} newSTRef (RuleResults mempty x [] True)
                   writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
-                  -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
-                  let s' = {-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push (recheck rs') (here s)}
+                  -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show birthPos)
+                  let s' = {-# SCC "g_s1" #-} s {reset = reset2 rs':reset s, here = push birthPos (recheck rs') (here s) } -- push (recheck rs') (here s)}
+                  -- TODO: move this to recheck?
                   foldMA (results (curPos s) rs') cbs s'
                 else do
                   !res <- readSTRef rs
-                  when (not $ queued res) $ do
-                    traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show $ curPos st)
+                  when (not $ queued res) $
+                    traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show birthPos)
                     -- unsafeIOToST $ printStack res
                   writeSTRef rs $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
-                  pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push (recheck rs) (here s) }
+                  pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push birthPos (recheck rs) (here s) }
           -- traceM $ show $ curPos st
           -- unsafeIOToST $ printStack f
           unParser (f p) (\(Results xs) -> xs g) (st {reset = resetcb:reset st})
@@ -223,7 +232,7 @@ ruleP f = do
   where
   foldMA :: a -> [a -> b -> ST s b] -> b -> ST s b
   foldMA y (x:xs) s = x y s >>= foldMA y xs
-  foldMA y [] s = pure s
+  foldMA _ [] s = pure s
 
 
 
@@ -237,15 +246,17 @@ bindList :: ([a] -> Parser s e i b) -> Parser s e i a -> Parser s e i b
 bindList f (Parser p) = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
 
 fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
-fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g $ pure $ f $ toList l)))
+-- TODO: strictness here matters
+-- (should be strict for thin, but probably not in general)
+fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g $ pure $! f $ toList l)))
 -- {-# INLINE fmapList #-}
 
 -- thin :: Parser s e i a -> Parser s e i ()
--- thin = fmapList (\_ -> ())
+thin = fmapList (\_ -> ())
 -- thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
 
-thin = id
+-- thin = id
 
 -- thin :: Parser s e i a -> Parser s e i ()
 -- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ pure $ ()))
@@ -303,7 +314,8 @@ emptyState i = State {
   curPos = 0,
   input = i,
   names = [],
-  here = Queue [] []
+  here = mempty
+  -- here = Queue [] []
 }
 
 -- | A parsing report, which contains fields that are useful for presenting
@@ -322,8 +334,10 @@ run :: Bool -> Parser s e [a] r -> [a] -> ST s ([(Seq r, Int)], Report e [a])
 run keep p l = do
   results <- newSTRef ([] :: [(Seq r,Int)])
   s1 <- unParser p (\(Results cb) -> cb (\a s -> modifySTRef results ((a,curPos s):) >> pure s)) (emptyState l)
-  let go s = case pop (here s) of
-        Just (x, xs) -> x (s { here = xs }) >>= go
+  let go s = case M.maxView (here s) of
+        Just (l,hr) -> go' (reverse l) (s { here = hr }) where
+          go' [] s = go s
+          go' (x:xs) s = x s >>= go' xs
         Nothing -> if null (next s)
           then do
             sequenceA_ (reset s)
@@ -340,8 +354,9 @@ run keep p l = do
             go $ State {
               next = [],
               input = tail $ input s,
-              -- TODO: don't use a linked list for this, mb like std::vector, & do fifo
-              here = Queue (next s) [],
+              -- TODO: this is wrong, should be keeping
+              -- info about birthPos in next
+              here = M.fromList [(curPos s + 1, next s)],
               curPos = curPos s + 1,
               names = [],
               reset = []
