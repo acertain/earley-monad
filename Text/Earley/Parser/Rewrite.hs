@@ -209,10 +209,11 @@ ruleP f = do
             writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
             -- traceM $ show $ curPos s
             -- unsafeIOToST $ printStack f
-            -- traceM $ "propagate " <> (show $ length $ callbacks rs) <> " from " <> (show $ birthPos) <> " at " <> (show $ curPos s)
+            -- traceM $ "propagate " <> (show $ length $ callbacks rs) <> " at " <> (show $ curPos s)
             foldMA xs (callbacks rs) s
     h !birthPos !ref x s = do
       !res <- readSTRef ref
+      -- undefined
       -- when (not $ queued res) $
           --   traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show birthPos)
           --   -- unsafeIOToST $ printStack res
@@ -223,7 +224,7 @@ ruleP f = do
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
           RuleI r cbs <- readSTRef ref
-          -- traceM $ "new child " <> (show $ length cbs) <> " at " <> (show birthPos)
+          traceM $ "new child " <> (show $ length cbs) <> " at " <> (show birthPos)
           writeSTRef ref $ RuleI r (cb:cbs)
           if r == emptyResults then pure st else cb (results birthPos birthPos r) st
         Nothing -> do
@@ -238,12 +239,12 @@ ruleP f = do
                 then do
                   rs' <- {-# SCC "g_rs'" #-} newSTRef $ DelayedResults [rxs]
                   writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
-                  -- traceM $ "g at " <> (show $ curPos s) <> " from " <> (show birthPos)
+                  traceM $ "g " <> (show $ length cbs) <> " at " <> (show birthPos) <> "-" <> (show $ curPos s)
                   let s' = {-# SCC "g_s1" #-} s {reset = reset2:reset s} -- , here = push birthPos (recheck rs') (here s) } -- push (recheck rs') (here s)}
-                  -- TODO: move this to another different recheck?
                   foldMA (results birthPos (curPos s) rs') cbs s'
                 else do
                   !res <- readSTRef rs
+                  traceM $ "g again at " <> (show birthPos) <> "-" <> (show $ curPos s)
                   case res of
                     DelayedResults rxs' -> do
                       writeSTRef rs (DelayedResults (rxs:rxs'))
@@ -278,6 +279,7 @@ fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> 
 
 -- thin :: Parser s e i a -> Parser s e i ()
 thin = fmapList (\_ -> ())
+-- thin (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> g $ One ()))
 -- thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
 
@@ -285,6 +287,12 @@ thin = fmapList (\_ -> ())
 
 -- thin :: Parser s e i a -> Parser s e i ()
 -- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ pure $ ()))
+
+traceP :: String -> Parser s e i a -> Parser s e i a
+traceP st (Parser p) = Parser $ \cb s -> do
+  let !left = curPos s
+  traceM $ (show left) <> ": " <> st
+  p (\r s' -> (traceM $ (show left) <> "-" <> (show $ curPos s') <> ": " <> st) >> cb r s') s
 
 instance Functor (Parser s e i) where
   fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f <$> x))
@@ -300,6 +308,7 @@ instance Applicative (Parser s e i) where
   {-# INLINE liftA2 #-}
   Parser a *> Parser b = Parser $ \cb -> a (\x -> b (\y -> cb (x *> y)))
   {-# INLINE (*>) #-}
+  --
   Parser a <* Parser b = Parser $ \cb -> a (\x -> b (\y -> cb (x <* y)))
   {-# INLINE (<*) #-}
 
@@ -360,14 +369,16 @@ run keep p l = do
   results <- newSTRef ([] :: [(Results s e i r,Int)])
   s1 <- unParser p (\rs s -> modifySTRef results ((rs,curPos s):) >> pure s) (emptyState l)
   let go s = case M.maxView (here s) of
-        Just (l,hr) -> go' (reverse l) (s { here = hr }) where
+        Just (l,hr) -> do
+          traceM $ show $ length l
+          go' (reverse l) (s { here = hr }) where
           go' [] s = go s
           go' (x:xs) s = x s >>= go' xs
         Nothing -> if null (next s)
           then do
             sequenceA_ (reset s)
             results' <- newSTRef ([] :: [(Seq r, Int)])
-            -- _
+            -- TODO
             rs <- readSTRef results'
             pure (rs, Report {
               position = curPos s,
