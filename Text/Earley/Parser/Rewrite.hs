@@ -128,11 +128,35 @@ instance Applicative (Results s e i) where
   -- -- {-# INLINE (<*) #-}
 
 
--- FIXME: can merge results at same rule w/ diff start pos & same end pos!
--- (if a calls b at pos i and j, and i-k & j-k both return results, only need to return once)
--- however, with fuly binarized/memoized grammars this is pointless
--- i.e. it must be that `a = b <*> c`, but `c` must be a rule, which does the merging for us
--- what about alts tho? shouldn't matter, but i'm not sure
+
+-- Can merge results at same rule w/ diff start pos & same end pos!
+-- (if a calls b at pos i and j, and i-k & j-k both return results, only need to return once with merged results)
+-- however, with fuly binarized/memoized grammars, ignoring alts, we can assume that `a = b <*> c`, but `c` must be a rule, which does some merging for us
+
+-- But this still adds too many callbacks to `c` (if c b returns at `i-k` & `j-k`, then `c` gets two instances of `a` in its conts),
+-- and callbacks in `c` cost per position where `c` succeeds starting from `k`
+
+-- Practical, General Parser Combinators (Meerkat) avoids this by using a HashSet of Conts in rules.
+
+-- However, this might not cause worst case complexity to go over cubic with fully binarized grammars. According to the meerkat paper,
+
+-- > In Appendix A.3 we show that the execution of memoized CPS
+-- > recognizers of Figure 2 and 6 can require O(n^(m+1)) operations, where
+-- > m is the length of the longest rule in the grammar. The reason for
+-- > such unbounded polynomial behaviour is that the same continuation
+-- > can be called multiple times at the same input position. As illustrated
+-- > in Appendix A.3, this happens when the same continuation is
+-- > added to different continuation lists that are associated with calls
+-- > made to the same recognizer but at different input positions.
+-- > If the recognizer produces the same input position starting from different
+-- > input positions, duplicate calls are made. The duplicate calls further
+-- > result in adding the same continuations to the same continuation
+-- > lists multiple times
+
+-- I think it still affects non-worst case complexity though :(
+
+-- I don't know if this is avoidable without using StableNames or similar to compare Conts
+
 
 -- recover :: Parser s e i a -> ST s (Parser s e i a)
 -- recover p = do
@@ -328,6 +352,9 @@ instance Monad (Parser s e i) where
 instance Alternative (Parser s e i) where
   empty = Parser $ \_ -> pure
   {-# INLINE empty #-}
+  -- TODO: can opt this when a & b both return results at same (start,end) range
+  -- (can merge results)
+  -- Earley does this
   Parser a <|> Parser b = Parser $ \cb -> a cb >=> b cb
   {-# INLINE (<|>) #-}
 
