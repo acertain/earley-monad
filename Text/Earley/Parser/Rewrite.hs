@@ -248,7 +248,7 @@ ruleP f = do
       readSTRef currentRef >>= \r -> case r of
         Just ref -> do
           RuleI r cbs <- readSTRef ref
-          traceM $ "new child " <> (show $ length cbs) <> " at " <> (show birthPos)
+          -- traceM $ "new child " <> (show $ length cbs) <> " at " <> (show birthPos)
           writeSTRef ref $ RuleI r (cb:cbs)
           if r == emptyResults then pure st else cb (results birthPos birthPos r) st
         Nothing -> do
@@ -263,12 +263,12 @@ ruleP f = do
                 then do
                   rs' <- {-# SCC "g_rs'" #-} newSTRef $ DelayedResults [rxs]
                   writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
-                  traceM $ "g " <> (show $ length cbs) <> " at " <> (show birthPos) <> "-" <> (show $ curPos s)
+                  -- traceM $ "g " <> (show $ length cbs) <> " at " <> (show birthPos) <> "-" <> (show $ curPos s)
                   let s' = {-# SCC "g_s1" #-} s {reset = reset2:reset s} -- , here = push birthPos (recheck rs') (here s) } -- push (recheck rs') (here s)}
                   foldMA (results birthPos (curPos s) rs') cbs s'
                 else do
                   !res <- readSTRef rs
-                  traceM $ "g again at " <> (show birthPos) <> "-" <> (show $ curPos s)
+                  -- traceM $ "g again at " <> (show birthPos) <> "-" <> (show $ curPos s)
                   case res of
                     DelayedResults rxs' -> do
                       writeSTRef rs (DelayedResults (rxs:rxs'))
@@ -397,16 +397,19 @@ run keep p l = do
   s1 <- unParser p (\rs s -> modifySTRef results ((rs,curPos s):) >> pure s) (emptyState l)
   let go s = case M.maxView (here s) of
         Just (l,hr) -> do
-          traceM $ show $ length l
+          -- traceM $ show $ length l
           go' (reverse l) (s { here = hr }) where
           go' [] s = go s
           go' (x:xs) s = x s >>= go' xs
         Nothing -> if null (next s)
           then do
             sequenceA_ (reset s)
-            results' <- newSTRef ([] :: [(Seq r, Int)])
-            -- TODO
-            rs <- readSTRef results'
+            rs' <- newSTRef ([] :: [(Seq r, Int)])
+            -- TODO: do we need s in Results?
+            -- readSTRef results >>= (traceM . show . length)
+            readSTRef results >>= traverse_ (\(Results rs, pos) -> rs (\x s' -> traceM (show $ length x) >> modifySTRef rs' ((x,pos):) >> pure s') ((emptyState l) {curPos = curPos s + 1}))
+            rs <- readSTRef rs'
+            -- traceM $ show $ length rs
             pure (rs, Report {
               position = curPos s,
               expected = names s,
@@ -458,19 +461,30 @@ interpGrammar g = case g of
 
 
 
-parser :: (forall r. Grammar r (Prod r e t a)) -> Parser s e [t] a
-parser g = join $ liftST $ fmap interpProd $ interpGrammar g
+parser :: (forall r. Grammar r (Prod r e t a)) -> ST s (Parser s e [t] a)
+parser g = fmap interpProd $ interpGrammar g
 {-# INLINE parser #-}
 
-allParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([(Seq a,Int)],Report e [t])
+-- allParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([(Seq a,Int)],Report e [t])
+-- allParses p i = runST $ do
+--   p' <- p
+--   run True p' i
+
+-- fullParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([Seq a],Report e [t])
+-- fullParses p i = runST $ do
+--   p' <- p
+--   first (fmap fst) <$> run False p' i
+
+allParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([(a,Int)],Report e [t])
 allParses p i = runST $ do
   p' <- p
-  run True p' i
+  first (foldMap $ \(s,p) -> (,p) <$> toList s) <$> run True p' i
 
-fullParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([Seq a],Report e [t])
+fullParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([a],Report e [t])
 fullParses p i = runST $ do
   p' <- p
-  first (fmap fst) <$> run False p' i
+  first (foldMap toList . fmap fst) <$> run False p' i
+
 
 -- | See e.g. how far the parser is able to parse the input string before it
 -- fails.  This can be much faster than getting the parse results for highly

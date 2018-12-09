@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, BangPatterns, DeriveFunctor, GADTs, Rank2Types, RecursiveDo #-}
+{-# LANGUAGE CPP, BangPatterns, DeriveFunctor, GADTs, Rank2Types, RecursiveDo, DeriveGeneric #-}
 -- | This module exposes the internals of the package: its API may change
 -- independently of the PVP-compliant version number.
 module Text.Earley.Parser.Internal where
@@ -14,7 +14,9 @@ import Debug.Trace
 #if !MIN_VERSION_base(4,8,0)
 import Data.Monoid
 #endif
+import GHC.Generics (Generic)
 import Data.Semigroup
+-- import Control.DeepSeq
 
 -------------------------------------------------------------------------------
 -- * Concrete rules and productions
@@ -172,7 +174,9 @@ data Report e i = Report
                       -- position.
   , unconsumed :: i   -- ^ The part of the input string that was not consumed,
                       -- which may be empty.
-  } deriving (Eq, Ord, Read, Show)
+  } deriving (Eq, Ord, Read, Show, Generic)
+
+-- instance (NFData i, NFData e) => NFData (Report e i)
 
 -- | The result of a parse.
 data Result s e i a

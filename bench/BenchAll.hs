@@ -48,34 +48,34 @@ treeSum n = let a = n `div` 2 -- will be at least 1
 
 -- Earley parser
 
-expr :: ST r (Parser r String [Token] Expr)
-expr = mdo
-  x1 <- rule $ Add <$> x1 <* namedToken "+" <*> x2
-            <|> x2
-            <?> "sum"
-  x2 <- rule $ Mul <$> x2 <* namedToken "*" <*> x3
-            <|> x3
-            <?> "product"
-  x3 <- rule $ Var <$> (satisfy isIdent <?> "identifier")
-            <|> namedToken "(" *> x1 <* namedToken ")"
-  return x1
+-- expr :: ST r (Parser r String [Token] Expr)
+-- expr = mdo
+--   x1 <- rule $ Add <$> x1 <* namedToken "+" <*> x2
+--             <|> x2
+--             <?> "sum"
+--   x2 <- rule $ Mul <$> x2 <* namedToken "*" <*> x3
+--             <|> x3
+--             <?> "product"
+--   x3 <- rule $ Var <$> (satisfy isIdent <?> "identifier")
+--             <|> namedToken "(" *> x1 <* namedToken ")"
+--   return x1
 
-isIdent :: String -> Bool
-isIdent (x:_) = isAlpha x
-isIdent _     = False
+-- isIdent :: String -> Bool
+-- isIdent (x:_) = isAlpha x
+-- isIdent _     = False
 
-sepBy1 :: Parser r e [t] a -> Parser r e [t] op -> ST r (Parser r e [t] [a])
-sepBy1 p op = mdo
-  ops <- rule' $ pure [] <|> (:) <$ op <*> p <*> ops
-  rule' $ (:) <$> p <*> ops
--- {-#  #-}
+-- sepBy1 :: Parser r e [t] a -> Parser r e [t] op -> ST r (Parser r e [t] [a])
+-- sepBy1 p op = mdo
+--   ops <- rule' $ pure [] <|> (:) <$ op <*> p <*> ops
+--   rule' $ (:) <$> p <*> ops
+-- -- {-#  #-}
 
-expr' :: ST r (Parser r String [Token] Expr)
-expr' = mdo
-  let var = Var <$> satisfy isIdent <|> token "(" *> mul <* token ")"
-  mul <- fmap (foldl1 Mul) <$> add `sepBy1` token "*"
-  add <- fmap (foldl1 Add) <$> var `sepBy1` token "+"
-  return mul
+-- expr' :: ST r (Parser r String [Token] Expr)
+-- expr' = mdo
+--   let var = Var <$> satisfy isIdent <|> token "(" *> mul <* token ")"
+--   mul <- fmap (foldl1 Mul) <$> add `sepBy1` token "*"
+--   add <- fmap (foldl1 Add) <$> var `sepBy1` token "+"
+--   return mul
 
 -- parseEarley :: [Token] -> Maybe Expr
 -- parseEarley input = listToMaybe (fst (fullParses ((>>= id) $ liftST expr) input))
@@ -85,19 +85,19 @@ expr' = mdo
 
 -- Parsec parsec
 
-type Parsec = Parsec.Parsec [Token] ()
+-- type Parsec = Parsec.Parsec [Token] ()
 
-parsecExpr :: Parsec Expr
-parsecExpr = mul
-  where mul   = foldl1 Mul <$> add `Parsec.sepBy1` t "*"
-        add   = foldl1 Add <$> var `Parsec.sepBy1` t "+"
-        ident = Parsec.token id pos $ \y -> if isIdent y then Just (Var y) else Nothing
-        var   = ident <|> (t "(" *> mul <* t ")")
-        t x   = Parsec.token id pos $ \y -> if x == y then Just x else Nothing
-        pos   = const (Parsec.initialPos "")
+-- parsecExpr :: Parsec Expr
+-- parsecExpr = mul
+--   where mul   = foldl1 Mul <$> add `Parsec.sepBy1` t "*"
+--         add   = foldl1 Add <$> var `Parsec.sepBy1` t "+"
+--         ident = Parsec.token id pos $ \y -> if isIdent y then Just (Var y) else Nothing
+--         var   = ident <|> (t "(" *> mul <* t ")")
+--         t x   = Parsec.token id pos $ \y -> if x == y then Just x else Nothing
+--         pos   = const (Parsec.initialPos "")
 
-parseParsec :: [Token] -> Maybe Expr
-parseParsec =  either (const Nothing) Just . Parsec.parse parsecExpr ""
+-- parseParsec :: [Token] -> Maybe Expr
+-- parseParsec =  either (const Nothing) Just . Parsec.parse parsecExpr ""
 
 -- Our benchmark harness.
 
@@ -116,8 +116,8 @@ inputBench (name, input) = bench name $ nf id input
 -- earley'Bench :: (String, [Token]) -> Benchmark
 -- earley'Bench (name, input) = bench name $ nf parseEarley' input
 
-parsecBench :: (String, [Token]) -> Benchmark
-parsecBench (name, input) = bench name $ nf parseParsec input
+-- parsecBench :: (String, [Token]) -> Benchmark
+-- parsecBench (name, input) = bench name $ nf parseParsec input
 
 benchSizes :: [Int]
 benchSizes = [100, 200] -- [51, 101, 151, 201]
@@ -130,11 +130,14 @@ treeInputs = map treeInput benchSizes
 
 veryAmbiguous :: ST r (Parser r Char String ())
 veryAmbiguous = mdo
-  -- t <- rule $ {-# SCC "rule_t" #-} thin $ () <$ s <* s
+  t <- rule $ {-# SCC "rule_t" #-} thin $ () <$ s <* s
+  -- s <- rule $ () <$ token 'b'
+  --           <|> s <* s
   s <- rule $ {-# SCC "rule_s" #-} thin $
         () <$ token 'b'
-           <|> traceP "l" s <* traceP "r" s
-          --  <|> s <* t
+          --  <|> s <* s
+           <|> s <* t
+           <|> t
           --  <?> 's'
   return s
 
@@ -144,11 +147,11 @@ main :: IO ()
 main = do 
   -- -- evaluate (rnf linearInputs)
   -- -- evaluate (rnf treeInputs)
-  print $ length $ fst $ fullParses veryAmbiguous (replicate 20 'b')
+  -- print $ length $ fst $ fullParses veryAmbiguous (replicate 20 'b')
   -- print $ length $ fst $ fullParses ((>>= id) $ liftST veryAmbiguous) (replicate 200 'b')
   -- -- pure ()
   -- -- pure ()
-  -- defaultMain $ fmap ambigTest [10,20..200]
+  defaultMain $ fmap ambigTest [10,20..300]
 
   -- defaultMain
   --   [ -- bgroup "inputs" $ map inputBench linearInputs 
