@@ -1,4 +1,4 @@
-{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase, FlexibleContexts #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
@@ -133,7 +133,7 @@ instance Applicative (Results s e i) where
 -- (if a calls b at pos i and j, and i-k & j-k both return results, only need to return once with merged results)
 -- however, with fuly binarized/memoized grammars, ignoring alts, we can assume that `a = b <*> c`, but `c` must be a rule, which does some merging for us
 
--- But this still adds too many callbacks to `c` (if c b returns at `i-k` & `j-k`, then `c` gets two instances of `a` in its conts),
+-- But this still adds too many callbacks to `c` (if b returns at `i-k` & `j-k`, then `c` gets two instances of `a` in its conts),
 -- and callbacks in `c` cost per position where `c` succeeds starting from `k`
 
 -- Practical, General Parser Combinators (Meerkat) avoids this by using a HashSet of Conts in rules.
@@ -166,7 +166,6 @@ instance Applicative (Results s e i) where
 data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
 
 
--- TODO: could we store a [Results s e i a] here?
 data RuleResults s e i a = RuleResults {
   processed :: !(Seq a),
   unprocessed :: !(Seq a),
@@ -279,10 +278,10 @@ ruleP f = do
           -- unsafeIOToST $ printStack f
           unParser (f p) g (st {reset = resetcb:reset st})
   pure p
-  where
-  foldMA :: forall s a b. a -> [a -> b -> ST s b] -> b -> ST s b
-  foldMA y (x:xs) s = x y s >>= foldMA y xs
-  foldMA _ [] s = pure s
+
+foldMA :: forall s a b. a -> [a -> b -> ST s b] -> b -> ST s b
+foldMA y (x:xs) s = x y s >>= foldMA y xs
+foldMA _ [] s = pure s
 
 
 
@@ -302,9 +301,9 @@ fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> 
 -- {-# INLINE fmapList #-}
 
 -- thin :: Parser s e i a -> Parser s e i ()
-thin = fmapList (\_ -> ())
+-- thin = fmapList (\_ -> ())
 -- thin (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> g $ One ()))
--- thin = bindList (\_ -> pure ())
+thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
 
 -- thin = id
@@ -391,23 +390,36 @@ data Report e i = Report
                       -- which may be empty.
   } deriving (Eq, Ord, Read, Show)
 
+-- newtype EndoC c a = EndoC { runEndoC :: c a a }
+
+-- instance Category c => Semigroup (EndoC c) where
+--   EndoC a <> EndoC b = EndoC (a . b)
+
+
+
+foldM2 :: forall s a b. [b -> ST s b] -> b -> ST s b
+foldM2 (x:xs) s = x s >>= foldM2 xs
+foldM2 [] s = pure s
+
 run :: Bool -> Parser s e [a] r -> [a] -> ST s ([(Seq r, Int)], Report e [a])
 run keep p l = do
   results <- newSTRef ([] :: [(Results s e i r,Int)])
   s1 <- unParser p (\rs s -> modifySTRef results ((rs,curPos s):) >> pure s) (emptyState l)
   let go s = case M.maxView (here s) of
-        Just (l,hr) -> do
-          -- traceM $ show $ length l
-          go' (reverse l) (s { here = hr }) where
-          go' [] s = go s
-          go' (x:xs) s = x s >>= go' xs
+        Just (l,hr) -> foldMA () (fmap const $ reverse l) (s { here = hr }) >>= go
         Nothing -> if null (next s)
           then do
             sequenceA_ (reset s)
             rs' <- newSTRef ([] :: [(Seq r, Int)])
             -- TODO: do we need s in Results?
-            -- readSTRef results >>= (traceM . show . length)
-            readSTRef results >>= traverse_ (\(Results rs, pos) -> rs (\x s' -> traceM (show $ length x) >> modifySTRef rs' ((x,pos):) >> pure s') ((emptyState l) {curPos = curPos s + 1}))
+            s' <- readSTRef results >>= foldr (\(Results rs, pos) -> (>>= rs (\x s' -> modifySTRef rs' ((x,pos):) >> pure s'))) (pure ((emptyState l) {curPos = curPos s + 1}))
+            -- t <- foldM2 (fmap foldM2 $ toList $ here s') (s' { here = mempty })
+            let l t | null (here t) = pure t
+                    | otherwise = foldM2 (fmap foldM2 $ toList $ here t) (t { here = mempty }) >>= l
+            l s'
+            -- traceM $ show $ length $ here t
+            -- when (not $ null $ here s') $ void $ go s'
+            -- go s'
             rs <- readSTRef rs'
             -- traceM $ show $ length rs
             pure (rs, Report {
