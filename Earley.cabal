@@ -1,6 +1,6 @@
 name:                Earley
 version:             0.12.1.0
-synopsis:            Parsing all context-free grammars using Earley's algorithm.
+synopsis:            Earley's algorithm extended to context-sensitive grammars
 description:         See <https://www.github.com/ollef/Earley> for more
                      information and
                      <https://github.com/ollef/Earley/tree/master/examples> for
@@ -13,7 +13,7 @@ copyright:           (c) 2014-2018 Olle Fredriksson
 category:            Parsing
 build-type:          Simple
 cabal-version:       >=1.10
-tested-with:         GHC==7.6.3, GHC==7.8.4, GHC==7.10.3, GHC==8.0.2, GHC==8.2.1, GHC==8.4.1
+tested-with:         GHC==8.6.3
 
 extra-source-files:
                       README.md
@@ -39,7 +39,7 @@ library
                        Text.Earley.Parser,
                        Text.Earley.Parser.Internal,
                        Text.Earley.Parser.Rewrite
-  build-depends:       base >=4.6 && <5, ListLike >=4.1, containers, criterion
+  build-depends:       base >=4.6 && <5, ListLike >=4.1, containers, criterion, parsers
   if impl(ghc < 8.0)
     build-depends:     semigroups >=0.18
   default-language:    Haskell2010

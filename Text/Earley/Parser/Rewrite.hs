@@ -1,8 +1,7 @@
-{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase, FlexibleContexts #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase, FlexibleContexts, FlexibleInstances #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
-import Control.Monad.ST.Unsafe
 -- import Control.Monad.Trans
 import Data.STRef
 import Control.Monad
@@ -11,14 +10,19 @@ import Control.Applicative
 import Control.Monad.Fix
 import Control.Arrow
 import Text.Earley.Grammar
-import Data.Coerce
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
+import Text.Parser.Combinators
 
-import qualified Data.Sequence as S
 import GHC.Stack
 
+
 import Debug.Trace
+import Data.Coerce
+import Data.List.NonEmpty (NonEmpty)
+
+
+
 
 type M s e i = State s e i -> ST s (State s e i)
 
@@ -29,7 +33,7 @@ data State s e i = State {
   -- actions to process once we're done at current position but before next position
   -- used only for rules, keyed by birthpos of the rule
   -- so we can get better complexity
-  here :: IntMap [M s e i], -- [(Int,Queue M s e i)] -- !(Queue (M s e i)),
+  here :: IntMap [M s e i],
   curPos :: {-# UNPACK #-} !Int,
   input :: i,
   names :: [e]
@@ -46,86 +50,58 @@ liftST :: ST s a -> Parser s e i a
 liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 {-# INLINE liftST #-}
 
-
--- data Queue a = Queue ![a] ![a]
-
--- push :: a -> Queue a -> Queue a
--- push a (Queue x y) = Queue (a:x) y
-
--- pop :: Queue a -> Maybe (a, Queue a)
--- pop (Queue [] []) = Nothing
--- pop (Queue x []) = pop $ trace ``"swap" $ Queue [] (reverse x)
--- pop (Queue x (y:ys)) = Just (y, Queue x ys)
-
 push :: Int -> a -> IntMap [a] -> IntMap [a]
 push i a = M.alter (Just . maybe [a] (a:)) i
 
--- could we s/[a]/a/ on Results? idk if it affects time complexity, but the user really should be able to get an [a]
--- maybe we can use some lazy IO trick to give the user a complete [a]? 
--- problem is if left recursion + user getting list. so we can't give the user a complete [a]
--- maybe could w/ nulls transformation though
-
--- TODO: different SMany, (<>) has the wrong asymtotics for []
--- invariant: SMany nonempty
-data Seq a = Zero | One a | SMany [a]
+-- for some reason this is faster than [a], probably because the instances are lazier
+-- / can detect nulls faster ??
+newtype Seq a = Seq {unSeq :: Maybe (NonEmpty a) }
 
 instance Functor Seq where
-  fmap f Zero = Zero
-  fmap f (One a) = One (f a)
-  fmap f (SMany a) = SMany (fmap f a)
+  fmap f = Seq . fmap (fmap f) . unSeq
+
 instance Applicative Seq where
-  pure = One
-  Zero <*> _ = Zero
-  _ <*> Zero = Zero
-  One f <*> One a = One (f a)
-  One f <*> SMany a = SMany (fmap f a)
-  SMany f <*> One a = SMany (fmap ($ a) f)
-  SMany f <*> SMany a = SMany (f <*> a)
-
-  _ <* Zero = Zero
-  Zero <* _ = Zero
-  a <* One _ = a
-  One a <* SMany b = SMany ([a] <* b)
-    -- where go [] = []
-    --       go (x:xs) = a:go xs
-  SMany a <* SMany b = SMany (a <* b)
-  -- a <* b = liftA2 const a b
-
+  pure a = Seq $ Just $ pure a
+  {-# INLINE pure #-}
+  Seq Nothing <*> _ = Seq Nothing
+  _ <*> Seq Nothing = Seq Nothing
+  Seq (Just f) <*> Seq (Just a) = Seq $ Just (f <*> a)
 
 instance Semigroup (Seq a) where
-  Zero <> a = a
-  a <> Zero = a
-  One a <> One b = SMany [a,b]
-  One a <> SMany b = SMany (a:b)
-  SMany a <> One b = SMany (a ++ [b])
-  SMany a <> SMany b = SMany (a ++ b)
+  Seq Nothing <> a = a
+  a <> Seq Nothing = a
+  Seq (Just a) <> Seq (Just b) = Seq (Just $ a <> b)
+  {-# INLINE (<>) #-}
 instance Monoid (Seq a) where
-  mempty = Zero
-instance Foldable Seq where
-  null Zero = True
-  null _ = False
-  toList Zero = []
-  toList (One a) = [a]
-  toList (SMany a) = a
-  foldMap f Zero = mempty
-  foldMap f (One a) = f a
-  foldMap f (SMany a) = foldMap f a
+  mempty = Seq Nothing
+  {-# INLINE mempty #-}
 
+instance Foldable Seq where
+  null (Seq Nothing) = True
+  null _ = False
+  {-# INLINE null #-}
+
+  toList (Seq Nothing) = []
+  toList (Seq (Just l)) = toList l
+  foldMap f = foldMap f . toList
 
 
 newtype Results s e i a = Results ((Seq a -> M s e i) -> M s e i)
 
 instance Functor (Results s e i) where
   fmap f (Results g) = Results (\cb -> g (\x -> let !r = fmap f x in cb r))
+  {-# INLINE fmap #-}
 instance Applicative (Results s e i) where
   pure x = Results (\cb -> cb $! pure x)
+  {-# INLINE pure #-}
   Results f <*> Results x = Results (\cb -> f (\a -> x (\b -> cb (a <*> b))))
+  {-# INLINE (<*>) #-}
   liftA2 f (Results x) (Results y) = Results (\cb -> x (\a -> y (\b -> cb (liftA2 f a b))))
-  -- Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
-  -- -- {-# INLINE (*>) #-}
-  -- -- Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let r = b *> a in cb r)))
+  {-# INLINE liftA2 #-}
+  Results x *> Results y = Results (\cb -> x (\a -> y (\b -> cb (a *> b))))
+  {-# INLINE (*>) #-}
   Results x <* Results y = Results (\cb -> x (\a -> y (\b -> let !r = a <* b in cb r)))
-  -- -- {-# INLINE (<*) #-}
+  {-# INLINE (<*) #-}
 
 
 
@@ -165,18 +141,14 @@ instance Applicative (Results s e i) where
 
 data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
 
-
+-- TODO: maybe store a (Maybe [a]) or have a variant w/o unprocessed? & another w/o processed?
 data RuleResults s e i a = RuleResults {
   processed :: !(Seq a),
   unprocessed :: !(Seq a),
   callbacks :: [Seq a -> M s e i],
   queued :: !Bool
-} | DelayedResults [(Seq a -> M s e i) -> M s e i]
+} | DelayedResults [(Seq a -> M s e i) -> M s e i] | ProcessedResults !(Seq a)
 
-printStack :: HasCallStack => a -> IO ()
-printStack a = do
-  stack <- ccsToStrings =<< getCurrentCCS a
-  putStrLn $ renderStack stack
 
 -- what if keeping callabcks around is what's causing the leak?
 -- 
@@ -195,13 +167,14 @@ ruleP f = do
     resetr !rs =
       -- TODO: when can we gc processed here?
       modifySTRef ({-# SCC "reset2_rs" #-} rs) $ \case
-        (RuleResults xs Zero _ False) -> RuleResults xs mempty undefined False
+        RuleResults xs s _ False | null s -> ProcessedResults xs
         DelayedResults rxs -> DelayedResults rxs
+        _ -> error "earley-monad: invariant violated"
     results !birthPos !pos !ref = Results $ \cb s -> do
       !res <- readSTRef ref
       case res of
+        ProcessedResults xs -> cb xs s
         DelayedResults rxs -> do
-          -- undefined
           writeSTRef ref $ RuleResults {
             processed = mempty,
             unprocessed = mempty,
@@ -209,37 +182,25 @@ ruleP f = do
             queued = False
           }
           foldMA (h birthPos ref) rxs $ s { reset = resetr ref:reset s }
-        RuleResults{} ->
-          -- TODO: is this right anymore?
-          if curPos s /= pos then
-            -- traceM $ "unaligned results: " <> show pos <> " from " <> show (curPos s)
-            -- unsafeIOToST $ printStack f
+        RuleResults{} -> do
+          writeSTRef ref $! res { callbacks = cb:callbacks res }
+          if null (processed res) then pure s else
             cb (processed res) s
-          else {-# SCC "results2" #-} do
-            -- when (not (null $ unprocessed res) && not (null $ processed res)) $ traceM "hi"
-            writeSTRef ref $! res { callbacks = cb:callbacks res }
-            if null (processed res) then pure s else
-              -- when (queued res) $ traceM "hi :|"
-              -- traceM $ show $ length $ callbacks res
-              cb (processed res) s
     recheck !ref s = do
       !rs <- readSTRef ref
       case rs of
-        DelayedResults rxs -> undefined
         RuleResults{} -> do
           let xs = unprocessed rs
           if null xs then pure s else {-# SCC "propagate" #-} do
             writeSTRef ref $! rs { unprocessed = mempty, processed = xs <> processed rs, queued = False }
-            -- traceM $ show $ curPos s
-            -- unsafeIOToST $ printStack f
             -- traceM $ "propagate " <> (show $ length $ callbacks rs) <> " at " <> (show $ curPos s)
             foldMA xs (callbacks rs) s
+        _ -> error "earley-monad: invariant violated"
     h !birthPos !ref x s = do
       !res <- readSTRef ref
-      -- undefined
+      -- traceM $ "h " <> show (length x) <> " at "<> (show $ curPos s) <> " from " <> (show birthPos)
       -- when (not $ queued res) $
           --   traceM $ "g again at " <> (show $ curPos s) <> " from " <> (show birthPos)
-          --   -- unsafeIOToST $ printStack res
       writeSTRef ref $! {-# SCC "g_res" #-} res { unprocessed = x <> unprocessed res, queued = True }
       pure $! if queued res then s else {-# SCC "g_s" #-} s { here = push birthPos (recheck ref) (here s) }
     p = Parser $ \cb st -> do
@@ -263,7 +224,7 @@ ruleP f = do
                   rs' <- {-# SCC "g_rs'" #-} newSTRef $ DelayedResults [rxs]
                   writeSTRef ref $ {-# SCC "g_ref" #-} RuleI rs' cbs
                   -- traceM $ "g " <> (show $ length cbs) <> " at " <> (show birthPos) <> "-" <> (show $ curPos s)
-                  let s' = {-# SCC "g_s1" #-} s {reset = reset2:reset s} -- , here = push birthPos (recheck rs') (here s) } -- push (recheck rs') (here s)}
+                  let !s' = {-# SCC "g_s1" #-} s {reset = reset2:reset s}
                   foldMA (results birthPos (curPos s) rs') cbs s'
                 else do
                   !res <- readSTRef rs
@@ -274,8 +235,7 @@ ruleP f = do
                       pure s
                     RuleResults{} ->
                       rxs (h birthPos rs) s
-          -- traceM $ show $ curPos st
-          -- unsafeIOToST $ printStack f
+                    _ -> error "earley-monad: invariant violated"
           unParser (f p) g (st {reset = resetcb:reset st})
   pure p
 
@@ -288,8 +248,8 @@ foldMA _ [] s = pure s
 -- fixP :: (Parser s e i a -> Parser s e i a) -> Parser s e i a
 -- fixP f = join $ liftST (ruleP f)
 
-rule' :: Parser s e i a -> ST s (Parser s e i a)
-rule' p = ruleP (\_ -> p)
+rule :: Parser s e i a -> ST s (Parser s e i a)
+rule p = ruleP (\_ -> p)
 
 bindList :: ([a] -> Parser s e i b) -> Parser s e i a -> Parser s e i b
 bindList f (Parser p) = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
@@ -302,14 +262,8 @@ fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> 
 
 -- thin :: Parser s e i a -> Parser s e i ()
 -- thin = fmapList (\_ -> ())
--- thin (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> g $ One ()))
 thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
-
--- thin = id
-
--- thin :: Parser s e i a -> Parser s e i ()
--- thin (Parser p) = Parser $ \cb -> p (\_ -> cb $ Results ($ pure $ ()))
 
 traceP :: String -> Parser s e i a -> Parser s e i a
 traceP st (Parser p) = Parser $ \cb s -> do
@@ -320,8 +274,8 @@ traceP st (Parser p) = Parser $ \cb s -> do
 instance Functor (Parser s e i) where
   fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f <$> x))
   {-# INLINE fmap #-}
-  -- x <$ Parser a = Parser $ \cb -> a _
-  -- {-# INLINE (<$) #-}
+  r <$ Parser a = Parser $ \cb -> a (\x -> cb (r <$ x))
+  {-# INLINE (<$) #-}
 instance Applicative (Parser s e i) where
   Parser f <*> Parser a = Parser $ \cb -> f (\f' -> a (\a' -> cb (f' <*> a')))
   {-# INLINE (<*>) #-}
@@ -331,7 +285,6 @@ instance Applicative (Parser s e i) where
   {-# INLINE liftA2 #-}
   Parser a *> Parser b = Parser $ \cb -> a (\x -> b (\y -> cb (x *> y)))
   {-# INLINE (*>) #-}
-  --
   Parser a <* Parser b = Parser $ \cb -> a (\x -> b (\y -> cb (x <* y)))
   {-# INLINE (<*) #-}
 
@@ -354,9 +307,21 @@ instance Alternative (Parser s e i) where
   -- TODO: can opt this when a & b both return results at same (start,end) range
   -- (can merge results)
   -- Earley does this
+  -- only matters for `(a <|> b) <*> c` though
   Parser a <|> Parser b = Parser $ \cb -> a cb >=> b cb
   {-# INLINE (<|>) #-}
 
+-- class CharStream s where
+--   -- satisfyS :: (Char -> Bool) -> s -> Maybe s
+--   uncons :: s -> Maybe (Char, s)
+
+instance Parsing (Parser s String [i]) where
+  try x = x
+  (<?>) = named
+  unexpected n = empty `named` ("unexpected " ++ n)
+  eof = Parser $ \cb s -> case input s of
+    [] -> cb (pure ()) s
+    _ -> pure s
 
 terminalP :: (t -> Maybe a) -> Parser s e [t] a
 terminalP v = Parser $ \cb s -> case input s of
@@ -411,8 +376,11 @@ run keep p l = do
           then do
             sequenceA_ (reset s)
             rs' <- newSTRef ([] :: [(Seq r, Int)])
+            -- readSTRef results >>= traceM . show . length
             -- TODO: do we need s in Results?
-            s' <- readSTRef results >>= foldr (\(Results rs, pos) -> (>>= rs (\x s' -> modifySTRef rs' ((x,pos):) >> pure s'))) (pure ((emptyState l) {curPos = curPos s + 1}))
+            s' <- readSTRef results >>= foldr
+              (\(Results rs, pos) -> (>>= rs (\x s' -> modifySTRef rs' ((x,pos):) >> pure s')))
+              (pure ((emptyState l) {curPos = curPos s + 1}))
             -- t <- foldM2 (fmap foldM2 $ toList $ here s') (s' { here = mempty })
             let l t | null (here t) = pure t
                     | otherwise = foldM2 (fmap foldM2 $ toList $ here t) (t { here = mempty }) >>= l
@@ -520,5 +488,4 @@ satisfy f = terminalP (\x -> if f x then Just x else Nothing)
 f <?> x = named f x
 
 namedToken x = token x `named` x
-rule = rule'
 
