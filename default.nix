@@ -1,5 +1,6 @@
 { mkDerivation, base, containers, criterion, deepseq, ListLike
-, parsec, QuickCheck, stdenv, tasty, tasty-hunit, tasty-quickcheck
+, parsec, parsers, QuickCheck, stdenv, tasty, tasty-hunit
+, tasty-quickcheck
 }:
 mkDerivation {
   pname = "Earley";
@@ -7,13 +8,15 @@ mkDerivation {
   src = ./.;
   isLibrary = true;
   isExecutable = true;
-  libraryHaskellDepends = [ base containers criterion ListLike ];
+  libraryHaskellDepends = [
+    base containers criterion ListLike parsers
+  ];
   testHaskellDepends = [
     base QuickCheck tasty tasty-hunit tasty-quickcheck
   ];
   benchmarkHaskellDepends = [
     base containers criterion deepseq ListLike parsec
   ];
-  description = "Parsing all context-free grammars using Earley's algorithm";
+  description = "Earley's algorithm extended to context-sensitive grammars";
   license = stdenv.lib.licenses.bsd3;
 }

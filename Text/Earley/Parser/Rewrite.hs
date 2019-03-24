@@ -1,4 +1,4 @@
-{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase, FlexibleContexts, FlexibleInstances, UnboxedSums #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase, FlexibleContexts, FlexibleInstances #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
