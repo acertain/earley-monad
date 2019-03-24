@@ -128,7 +128,7 @@ linearInputs = map linearInput benchSizes
 treeInputs :: [(String, [Token])]
 treeInputs = map treeInput benchSizes
 
-veryAmbiguous :: ST r (Parser r Char String ())
+veryAmbiguous :: ST r (Parser r String ())
 veryAmbiguous = mdo
   t <- rule $ thin $ () <$ s <* s
   -- s <- rule $ () <$ token 'b'

@@ -1,4 +1,4 @@
-{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase, FlexibleContexts, FlexibleInstances #-}
+{-# LANGUAGE RankNTypes, GADTs, TupleSections, OverloadedLists, BangPatterns, ScopedTypeVariables, LambdaCase, FlexibleContexts, FlexibleInstances, UnboxedSums #-}
 module Text.Earley.Parser.Rewrite where
 
 import Control.Monad.ST
@@ -24,29 +24,30 @@ import Data.List.NonEmpty (NonEmpty)
 
 
 
-type M s e i = State s e i -> ST s (State s e i)
+type M s i = State s i -> ST s (State s i)
 
 -- TODO: more stuff here
-data State s e i = State {
+data State s i = State {
   reset :: ![ST s ()],
-  next :: ![M s e i],
+  next :: ![M s i],
   -- actions to process once we're done at current position but before next position
   -- used only for rules, keyed by birthpos of the rule
   -- so we can get better complexity
-  here :: IntMap [M s e i],
+  here :: !(IntMap [M s i]),
   curPos :: {-# UNPACK #-} !Int,
-  input :: i,
-  names :: [e]
+  input :: !i,
+  -- | Named productions processed at current positition, used for reporting expected in errors
+  names :: ![String]
 }
 -- obvious way to do coalescing & skip through input is to have next be
 -- :: Map (Position,RuleI s e i a) [a -> State s e i -> ST s (State s e i)]
 
 
-newtype Parser s e i a = Parser {
-  unParser :: (Results s e i a -> M s e i) -> M s e i
+newtype Parser s i a = Parser {
+  unParser :: (Results s i a -> M s i) -> M s i
 }
 
-liftST :: ST s a -> Parser s e i a
+liftST :: ST s a -> Parser s i a
 liftST f = Parser $ \cb s -> f >>= \x -> cb (pure x) s
 {-# INLINE liftST #-}
 
@@ -86,12 +87,12 @@ instance Foldable Seq where
   foldMap f = foldMap f . toList
 
 
-newtype Results s e i a = Results ((Seq a -> M s e i) -> M s e i)
+newtype Results s i a = Results ((Seq a -> M s i) -> M s i)
 
-instance Functor (Results s e i) where
+instance Functor (Results s i) where
   fmap f (Results g) = Results (\cb -> g (\x -> let !r = fmap f x in cb r))
   {-# INLINE fmap #-}
-instance Applicative (Results s e i) where
+instance Applicative (Results s i) where
   pure x = Results (\cb -> cb $! pure x)
   {-# INLINE pure #-}
   Results f <*> Results x = Results (\cb -> f (\a -> x (\b -> cb (a <*> b))))
@@ -139,15 +140,15 @@ instance Applicative (Results s e i) where
 --   _
 
 
-data RuleI s e i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s e i a)) [Results s e i a -> M s e i]
+data RuleI s i a = RuleI {-# UNPACK #-} !(STRef s (RuleResults s i a)) [Results s i a -> M s i]
 
 -- TODO: maybe store a (Maybe [a]) or have a variant w/o unprocessed? & another w/o processed?
-data RuleResults s e i a = RuleResults {
+data RuleResults s i a = RuleResults {
   processed :: !(Seq a),
   unprocessed :: !(Seq a),
-  callbacks :: [Seq a -> M s e i],
+  callbacks :: [Seq a -> M s i],
   queued :: !Bool
-} | DelayedResults [(Seq a -> M s e i) -> M s e i] | ProcessedResults !(Seq a)
+} | DelayedResults [(Seq a -> M s i) -> M s i] | ProcessedResults !(Seq a)
 
 
 -- what if keeping callabcks around is what's causing the leak?
@@ -156,12 +157,12 @@ data RuleResults s e i a = RuleResults {
 -- NOTE: techincally this is two things in one (GLL (and us) merge them):
 -- 1. merge multiple `Result`s at same position (optimization, needed to be `O(n^3)`, speeds up `rule (\_ -> (a <|> b) <*> c`)
 -- 2. cps processing for start position, to deal with left recursion
-ruleP :: forall s e i a. (Parser s e i a -> Parser s e i a) -> ST s (Parser s e i a)
+ruleP :: forall s i a. (Parser s i a -> Parser s i a) -> ST s (Parser s i a)
 ruleP f = do
   -- TODO: remove the Maybe, just use an empty RuleI
-  currentRef <- newSTRef (Nothing :: Maybe (STRef s (RuleI s e i a)))
+  currentRef <- newSTRef (Nothing :: Maybe (STRef s (RuleI s i a)))
 
-  emptyResults <- newSTRef (undefined :: RuleResults s e i a)
+  emptyResults <- newSTRef (undefined :: RuleResults s i a)
   let
     resetcb = writeSTRef currentRef Nothing
     resetr !rs =
@@ -248,13 +249,13 @@ foldMA _ [] s = pure s
 -- fixP :: (Parser s e i a -> Parser s e i a) -> Parser s e i a
 -- fixP f = join $ liftST (ruleP f)
 
-rule :: Parser s e i a -> ST s (Parser s e i a)
+rule :: Parser s i a -> ST s (Parser s i a)
 rule p = ruleP (\_ -> p)
 
-bindList :: ([a] -> Parser s e i b) -> Parser s e i a -> Parser s e i b
+bindList :: ([a] -> Parser s i b) -> Parser s i a -> Parser s i b
 bindList f (Parser p) = Parser $ \cb -> p (\(Results x) -> x (\l -> unParser (f $ toList l) cb))
 
-fmapList :: ([a] -> b) -> Parser s e i a -> Parser s e i b
+fmapList :: ([a] -> b) -> Parser s i a -> Parser s i b
 -- TODO: strictness here matters
 -- (should be strict for thin, but probably not in general)
 fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> rs (\l -> g $ pure $! f $ toList l)))
@@ -265,18 +266,18 @@ fmapList f (Parser p) = Parser $ \cb -> p (\(Results rs) -> cb (Results $ \g -> 
 thin = bindList (\_ -> pure ())
 -- {-# INLINE thin #-}
 
-traceP :: String -> Parser s e i a -> Parser s e i a
+traceP :: String -> Parser s i a -> Parser s i a
 traceP st (Parser p) = Parser $ \cb s -> do
   let !left = curPos s
   traceM $ (show left) <> ": " <> st
   p (\r s' -> (traceM $ (show left) <> "-" <> (show $ curPos s') <> ": " <> st) >> cb r s') s
 
-instance Functor (Parser s e i) where
+instance Functor (Parser s i) where
   fmap f (Parser p) = Parser $ \cb -> p (\x -> cb (f <$> x))
   {-# INLINE fmap #-}
   r <$ Parser a = Parser $ \cb -> a (\x -> cb (r <$ x))
   {-# INLINE (<$) #-}
-instance Applicative (Parser s e i) where
+instance Applicative (Parser s i) where
   Parser f <*> Parser a = Parser $ \cb -> f (\f' -> a (\a' -> cb (f' <*> a')))
   {-# INLINE (<*>) #-}
   pure a = Parser ($ pure a)
@@ -295,13 +296,13 @@ instance Applicative (Parser s e i) where
   -- -- Parser a *> Parser b = Parser $ \cb -> a (\_ -> b cb)
   -- -- 
   -- {-# INLINE (*>) #-}
-instance Monad (Parser s e i) where
+instance Monad (Parser s i) where
   return = pure
   {-# INLINE return #-}
   Parser p >>= f = Parser $ \cb -> p (\(Results a) -> a (\xs s -> foldrM (\x -> unParser (f x) cb) s xs))
   {-# INLINE (>>=) #-}
 
-instance Alternative (Parser s e i) where
+instance Alternative (Parser s i) where
   empty = Parser $ \_ -> pure
   {-# INLINE empty #-}
   -- TODO: can opt this when a & b both return results at same (start,end) range
@@ -315,15 +316,26 @@ instance Alternative (Parser s e i) where
 --   -- satisfyS :: (Char -> Bool) -> s -> Maybe s
 --   uncons :: s -> Maybe (Char, s)
 
-instance Parsing (Parser s String [i]) where
+
+-- class IsNull s where
+--   isNull :: s -> Bool
+
+instance Parsing (Parser s [i]) where
   try x = x
   (<?>) = named
   unexpected n = empty `named` ("unexpected " ++ n)
   eof = Parser $ \cb s -> case input s of
     [] -> cb (pure ()) s
     _ -> pure s
+  -- TODO: notFollowedBy should really backtrack
+  -- in general it might consume an arbitrary amount of input before failing
+  -- / stop throwing away input / support lookahead
+  -- a bit complex to do correctly though
+  -- similar(same?) problem to error recovery
+  -- TODO: it's possible to implement a non-backtracking notFollowedBy without lookahead
+  -- & non-backtracking is actually fine for most (all?) uses
 
-terminalP :: (t -> Maybe a) -> Parser s e [t] a
+terminalP :: (t -> Maybe a) -> Parser s [t] a
 terminalP v = Parser $ \cb s -> case input s of
   [] -> pure s
   (x:_) -> case v x of
@@ -331,8 +343,7 @@ terminalP v = Parser $ \cb s -> case input s of
     Just a -> pure $ s {next = cb (pure a):next s}
 -- {-# INLINE terminalP #-}
 
-
-emptyState :: i -> State s e i
+emptyState :: i -> State s i
 emptyState i = State {
   reset = [],
   next = [],
@@ -340,16 +351,15 @@ emptyState i = State {
   input = i,
   names = [],
   here = mempty
-  -- here = Queue [] []
 }
 
 -- | A parsing report, which contains fields that are useful for presenting
 -- errors to the user if a parse is deemed a failure.  Note however that we get
 -- a report even when we successfully parse something.
-data Report e i = Report
+data Report i = Report
   { position   :: Int -- ^ The final position in the input (0-based) that the
                       -- parser reached.
-  , expected   :: [e] -- ^ The named productions processed at the final
+  , expected   :: [String] -- ^ The named productions processed at the final
                       -- position.
   , unconsumed :: i   -- ^ The part of the input string that was not consumed,
                       -- which may be empty.
@@ -366,9 +376,9 @@ foldM2 :: forall s a b. [b -> ST s b] -> b -> ST s b
 foldM2 (x:xs) s = x s >>= foldM2 xs
 foldM2 [] s = pure s
 
-run :: Bool -> Parser s e [a] r -> [a] -> ST s ([(Seq r, Int)], Report e [a])
+run :: Bool -> Parser s [a] r -> [a] -> ST s ([(Seq r, Int)], Report [a])
 run keep p l = do
-  results <- newSTRef ([] :: [(Results s e i r,Int)])
+  results <- newSTRef ([] :: [(Results s i r,Int)])
   s1 <- unParser p (\rs s -> modifySTRef results ((rs,curPos s):) >> pure s) (emptyState l)
   let go s = case M.maxView (here s) of
         Just (l,hr) -> foldMA () (fmap const $ reverse l) (s { here = hr }) >>= go
@@ -411,39 +421,40 @@ run keep p l = do
             }
   go s1
 
-named :: Parser s e i a -> e -> Parser s e i a
+named :: Parser s i a -> String -> Parser s i a
 named (Parser p) e = Parser $ \cb s -> p cb (s{names = e:names s})
 {-# INLINE named #-}
 
-newtype Rule s e t a = Rule (Parser s e [t] a)
+data Rule s e t a where 
+  Rule :: Parser s [t] a -> Rule s String t a
 
-interpProd :: Prod (Rule s) e t a -> Parser s e [t] a
-interpProd p = case p of
-  Terminal t f -> terminalP t <**> interpProd f
-  NonTerminal (Rule r) f -> r <**> interpProd f
-  Pure a -> pure a
-  Alts as f -> foldr (<|>) empty (fmap interpProd as) <**> interpProd f
-  Many m f -> many (interpProd m) <**> interpProd f
-  Named f e -> interpProd f `named` e
-{-# INLINE interpProd #-}
+-- interpProd :: Prod (Rule s) String t a -> Parser s [t] a
+-- interpProd p = case p of
+--   Terminal t f -> terminalP t <**> interpProd f
+--   NonTerminal (Rule r) f -> r <**> interpProd f
+--   Pure a -> pure a
+--   Alts as f -> foldr (<|>) empty (fmap interpProd as) <**> interpProd f
+--   Many m f -> many (interpProd m) <**> interpProd f
+--   Named f e -> interpProd f `named` e
+-- {-# INLINE interpProd #-}
 
-interpGrammar :: Grammar (Rule s) a -> ST s a
-interpGrammar g = case g of
-  RuleBind p f -> do
-    r <- ruleP (\_ -> interpProd p)
-    let p' = NonTerminal (Rule r) (pure id)
-    interpGrammar (f p')
-  FixBind f k -> do
-    a <- mfix (interpGrammar . f)
-    interpGrammar $ k a
-  Return a -> pure a
-{-# INLINE interpGrammar #-}
+-- interpGrammar :: Grammar (Rule s) a -> ST s a
+-- interpGrammar g = case g of
+--   RuleBind p f -> do
+--     r <- ruleP (\_ -> interpProd p)
+--     let p' = NonTerminal (Rule r) (pure id)
+--     interpGrammar (f p')
+--   FixBind f k -> do
+--     a <- mfix (interpGrammar . f)
+--     interpGrammar $ k a
+--   Return a -> pure a
+-- {-# INLINE interpGrammar #-}
 
 
 
-parser :: (forall r. Grammar r (Prod r e t a)) -> ST s (Parser s e [t] a)
-parser g = fmap interpProd $ interpGrammar g
-{-# INLINE parser #-}
+-- parser :: (forall r. Grammar r (Prod r String t a)) -> ST s (Parser s [t] a)
+-- parser g = fmap interpProd $ interpGrammar g
+-- {-# INLINE parser #-}
 
 -- allParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([(Seq a,Int)],Report e [t])
 -- allParses p i = runST $ do
@@ -455,12 +466,12 @@ parser g = fmap interpProd $ interpGrammar g
 --   p' <- p
 --   first (fmap fst) <$> run False p' i
 
-allParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([(a,Int)],Report e [t])
+allParses :: (forall s. ST s (Parser s [t] a)) -> [t] -> ([(a,Int)],Report [t])
 allParses p i = runST $ do
   p' <- p
   first (foldMap $ \(s,p) -> (,p) <$> toList s) <$> run True p' i
 
-fullParses :: (forall s. ST s (Parser s e [t] a)) -> [t] -> ([a],Report e [t])
+fullParses :: (forall s. ST s (Parser s [t] a)) -> [t] -> ([a],Report [t])
 fullParses p i = runST $ do
   p' <- p
   first (foldMap toList . fmap fst) <$> run False p' i
@@ -469,7 +480,7 @@ fullParses p i = runST $ do
 -- | See e.g. how far the parser is able to parse the input string before it
 -- fails.  This can be much faster than getting the parse results for highly
 -- ambiguous grammars.
-report :: (forall s. ST s (Parser s e [t] a)) -> [t] -> Report e [t]
+report :: (forall s. ST s (Parser s [t] a)) -> [t] -> Report [t]
 report p i = runST $ do
   p' <- p
   snd <$> run False p' i
@@ -477,11 +488,11 @@ report p i = runST $ do
 -- ident (x:_) = isAlpha x
 -- ident _     = False
 
-token :: Eq t => t -> Parser s e [t] t
+token :: Eq t => t -> Parser s [t] t
 token y = satisfy (== y)
 {-# NOINLINE token #-}
 
-satisfy :: (t -> Bool) -> Parser s e [t] t
+satisfy :: (t -> Bool) -> Parser s [t] t
 satisfy f = terminalP (\x -> if f x then Just x else Nothing)
 {-# NOINLINE satisfy #-}
 
